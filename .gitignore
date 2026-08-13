@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+*.log.[0-9]*
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec
