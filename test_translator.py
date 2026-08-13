@@ -5,22 +5,29 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import queue
 import select
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 from translator import (
     CrLfNormalizer,
     PortSettings,
+    SerialBridgeController,
+    SerialException,
     TrafficLogger,
     ascii_view,
+    build_parser,
     gw_to_pl_worker,
     main,
     open_serial,
     pl_to_gw_worker,
+    session_log_path,
     simulated_traffic,
 )
 
@@ -71,6 +78,14 @@ class CliValidationTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertIn("must be greater than zero", stderr.getvalue())
 
+    def test_side_specific_serial_options_are_parsed(self) -> None:
+        args = build_parser().parse_args(
+            ["--gw-parity", "E", "--pl-stopbits", "2", "--gw-rtscts"]
+        )
+        self.assertEqual(args.gw_parity, "E")
+        self.assertEqual(args.pl_stopbits, 2)
+        self.assertTrue(args.gw_rtscts)
+
 
 class DisplayTests(unittest.TestCase):
     def test_ascii_view_keeps_control_bytes_visible(self) -> None:
@@ -88,6 +103,12 @@ class SimulationTests(unittest.TestCase):
 
 
 class TrafficLoggerTests(unittest.TestCase):
+    def test_session_log_path_keeps_parent_and_adds_timestamp(self) -> None:
+        result = session_log_path(
+            "/tmp/bridge.log", now=datetime(2026, 8, 13, 14, 25, 30, 123456)
+        )
+        self.assertEqual(result, "/tmp/bridge_20260813-142530-123456.log")
+
     def test_file_log_rotates_at_configured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log_path = Path(directory) / "bridge.log"
@@ -102,6 +123,34 @@ class TrafficLoggerTests(unittest.TestCase):
 
             self.assertTrue(log_path.exists())
             self.assertTrue(log_path.with_name("bridge.log.1").exists())
+
+
+class ReconnectTests(unittest.TestCase):
+    def test_controller_retries_a_failed_serial_open_until_stopped(self) -> None:
+        events: queue.Queue[tuple[str, str]] = queue.Queue()
+        controller = SerialBridgeController(events)
+        settings = PortSettings(
+            port="missing-port", baudrate=9600, bytesize=8, parity="N", stopbits=1,
+            timeout=0.01, write_timeout=1.0, xonxoff=False, rtscts=False, dsrdtr=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("translator.open_serial", side_effect=SerialException("disconnected")) as opener:
+                controller.start(settings, settings, 0.01, str(Path(directory) / "bridge.log"), True, 0.01)
+                deadline = time.monotonic() + 1.0
+                while opener.call_count < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                controller.stop()
+                deadline = time.monotonic() + 1.0
+                while controller.running and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+        self.assertGreaterEqual(opener.call_count, 2)
+        states = []
+        while not events.empty():
+            kind, payload = events.get_nowait()
+            if kind == "state":
+                states.append(payload)
+        self.assertTrue(any(state.startswith("reconnecting|") for state in states))
 
 
 @unittest.skipIf(os.name == "nt", "PTY integration test requires POSIX")

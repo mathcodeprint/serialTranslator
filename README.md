@@ -53,6 +53,8 @@ dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe
 
 The application stores its default GUI traffic log and saved settings in the
 current user's application-settings directory, not beside the installed `.exe`.
+Every bridge start creates a separate timestamped session log; each session log
+still rotates at 5 MiB with three retained backups.
 
 ## See available ports
 
@@ -68,8 +70,9 @@ If both sides use 9600 8-N-1:
 py translator.py --gw-port COM6 --pl-port COM4 --baud 9600
 ```
 
-Traffic is printed to the console and written to `prolab_translator.log`.
-Logs rotate at 5 MiB and retain three backups.
+Traffic is printed to the console and written to a timestamped session log,
+such as `prolab_translator_20260813-142530-123456.log`. Each session log
+rotates at 5 MiB and retains three backups.
 
 ## Run the desktop UI
 
@@ -78,7 +81,13 @@ py translator.py --gui
 ```
 
 The GUI keeps serial work on background threads and shows the same traffic log
-live. It can use different baud rates for GasWorks and ProLab.
+live. GasWorks and ProLab each have their own baud rate, data bits, parity,
+stop bits, and XON/XOFF, RTS/CTS, and DSR/DTR flow-control settings.
+
+The GUI retries a dropped or unavailable serial connection every three seconds
+by default. The status changes to **Reconnecting** while it retries; use
+**Stop Bridge** to stop retrying, or turn off **Auto reconnect** for a
+single-attempt session.
 
 ## Simulate traffic without instruments
 
@@ -133,6 +142,11 @@ Other serial options are available:
 --rtscts
 --dsrdtr
 ```
+
+For devices whose non-baud settings differ, use the side-specific CLI options,
+for example `--gw-parity E --pl-parity N` or `--gw-rtscts`. The GUI provides
+these settings directly for each side; automatic reconnect is currently a GUI
+feature.
 
 Run:
 

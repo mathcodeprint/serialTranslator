@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,16 @@ from serial.tools import list_ports
 
 
 APP_NAME = "GasWorks-ProLab Serial Translator"
+
+
+def session_log_path(log_file: Optional[str], now: Optional[datetime] = None) -> Optional[str]:
+    """Derive a unique timestamped log path for one bridge session."""
+    if not log_file:
+        return None
+    path = Path(log_file).expanduser()
+    timestamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+    suffix = path.suffix or ".log"
+    return str(path.with_name(f"{path.stem}_{timestamp}{suffix}"))
 
 
 def ascii_view(data: bytes) -> str:
@@ -405,18 +416,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Data bits (default: 8)",
     )
+    parser.add_argument("--gw-bytesize", type=int, choices=(5, 6, 7, 8), help="Override GasWorks-side data bits")
+    parser.add_argument("--pl-bytesize", type=int, choices=(5, 6, 7, 8), help="Override ProLab-side data bits")
     parser.add_argument(
         "--parity",
         choices=("N", "E", "O", "M", "S"),
         default="N",
         help="Parity: N/E/O/M/S (default: N)",
     )
+    parser.add_argument("--gw-parity", choices=("N", "E", "O", "M", "S"), help="Override GasWorks-side parity")
+    parser.add_argument("--pl-parity", choices=("N", "E", "O", "M", "S"), help="Override ProLab-side parity")
     parser.add_argument(
         "--stopbits",
         type=parse_stopbits,
         default=serial.STOPBITS_ONE,
         help="Stop bits: 1, 1.5, or 2 (default: 1)",
     )
+    parser.add_argument("--gw-stopbits", type=parse_stopbits, help="Override GasWorks-side stop bits")
+    parser.add_argument("--pl-stopbits", type=parse_stopbits, help="Override ProLab-side stop bits")
     parser.add_argument(
         "--read-timeout-ms",
         type=float,
@@ -441,6 +458,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xonxoff", action="store_true", help="Enable XON/XOFF flow control")
     parser.add_argument("--rtscts", action="store_true", help="Enable RTS/CTS flow control")
     parser.add_argument("--dsrdtr", action="store_true", help="Enable DSR/DTR flow control")
+    parser.add_argument("--gw-xonxoff", action="store_true", help="Enable XON/XOFF on the GasWorks side")
+    parser.add_argument("--pl-xonxoff", action="store_true", help="Enable XON/XOFF on the ProLab side")
+    parser.add_argument("--gw-rtscts", action="store_true", help="Enable RTS/CTS on the GasWorks side")
+    parser.add_argument("--pl-rtscts", action="store_true", help="Enable RTS/CTS on the ProLab side")
+    parser.add_argument("--gw-dsrdtr", action="store_true", help="Enable DSR/DTR on the GasWorks side")
+    parser.add_argument("--pl-dsrdtr", action="store_true", help="Enable DSR/DTR on the ProLab side")
     parser.add_argument(
         "--log-file",
         default="prolab_translator.log",
@@ -474,31 +497,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("ERROR: --write-timeout must be greater than zero.", file=sys.stderr)
         return 2
 
-    traffic_log = TrafficLogger(args.log_file or None, console=not args.quiet)
+    session_log = session_log_path(args.log_file)
+    traffic_log = TrafficLogger(session_log, console=not args.quiet)
 
     gw_settings = PortSettings(
         port=args.gw_port,
         baudrate=args.gw_baud or args.baud,
-        bytesize=args.bytesize,
-        parity=args.parity,
-        stopbits=args.stopbits,
+        bytesize=args.gw_bytesize or args.bytesize,
+        parity=args.gw_parity or args.parity,
+        stopbits=args.gw_stopbits or args.stopbits,
         timeout=args.read_timeout_ms / 1000.0,
         write_timeout=args.write_timeout,
-        xonxoff=args.xonxoff,
-        rtscts=args.rtscts,
-        dsrdtr=args.dsrdtr,
+        xonxoff=args.xonxoff or args.gw_xonxoff,
+        rtscts=args.rtscts or args.gw_rtscts,
+        dsrdtr=args.dsrdtr or args.gw_dsrdtr,
     )
     pl_settings = PortSettings(
         port=args.pl_port,
         baudrate=args.pl_baud or args.baud,
-        bytesize=args.bytesize,
-        parity=args.parity,
-        stopbits=args.stopbits,
+        bytesize=args.pl_bytesize or args.bytesize,
+        parity=args.pl_parity or args.parity,
+        stopbits=args.pl_stopbits or args.stopbits,
         timeout=args.read_timeout_ms / 1000.0,
         write_timeout=args.write_timeout,
-        xonxoff=args.xonxoff,
-        rtscts=args.rtscts,
-        dsrdtr=args.dsrdtr,
+        xonxoff=args.xonxoff or args.pl_xonxoff,
+        rtscts=args.rtscts or args.pl_rtscts,
+        dsrdtr=args.dsrdtr or args.pl_dsrdtr,
     )
 
     gw: Optional[serial.Serial] = None
@@ -508,6 +532,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         traffic_log.info(f"Starting {APP_NAME}")
+        if session_log:
+            traffic_log.info(f"Session log: {session_log}")
         traffic_log.info(
             f"GasWorks-side translator port: {gw_settings.port} "
             f"({gw_settings.baudrate},{gw_settings.bytesize},{gw_settings.parity},{args.stopbits})"
@@ -832,6 +858,8 @@ class SerialBridgeController:
         pl_settings: PortSettings,
         cr_wait_s: float,
         log_file: Optional[str],
+        auto_reconnect: bool,
+        reconnect_delay_s: float,
     ) -> None:
         with self._lock:
             if self.running:
@@ -842,7 +870,10 @@ class SerialBridgeController:
             self._supervisor = threading.Thread(
                 target=self._run,
                 name="bridge-supervisor",
-                args=(gw_settings, pl_settings, cr_wait_s, log_file),
+                args=(
+                    gw_settings, pl_settings, cr_wait_s, log_file,
+                    auto_reconnect, reconnect_delay_s,
+                ),
                 daemon=True,
             )
             self._supervisor.start()
@@ -861,14 +892,12 @@ class SerialBridgeController:
         pl_settings: PortSettings,
         cr_wait_s: float,
         log_file: Optional[str],
+        auto_reconnect: bool,
+        reconnect_delay_s: float,
     ) -> None:
-        gw: Optional[serial.Serial] = None
-        pl: Optional[serial.Serial] = None
-        t_gw_pl: Optional[threading.Thread] = None
-        t_pl_gw: Optional[threading.Thread] = None
         queue_handler: Optional[QueueLogHandler] = None
         traffic_log: Optional[TrafficLogger] = None
-        failed = False
+        terminal_error = False
 
         try:
             traffic_log = TrafficLogger(log_file, console=False)
@@ -884,6 +913,8 @@ class SerialBridgeController:
             traffic_log.add_handler(queue_handler)
 
             traffic_log.info(f"Starting {APP_NAME}")
+            if log_file:
+                traffic_log.info(f"Session log: {log_file}")
             traffic_log.info(
                 "GasWorks-side translator port: "
                 f"{gw_settings.port} ({gw_settings.baudrate},"
@@ -895,68 +926,85 @@ class SerialBridgeController:
                 f"{pl_settings.bytesize},{pl_settings.parity},{pl_settings.stopbits})"
             )
 
-            gw = open_serial(gw_settings)
-            traffic_log.info(f"Opened GasWorks-side port {gw.port}")
+            attempt = 0
+            while not self.stop_event.is_set():
+                gw: Optional[serial.Serial] = None
+                pl: Optional[serial.Serial] = None
+                t_gw_pl: Optional[threading.Thread] = None
+                t_pl_gw: Optional[threading.Thread] = None
+                session_stop = threading.Event()
+                session_failed = False
+                try:
+                    if attempt:
+                        message = f"Reconnecting (attempt {attempt})..."
+                        traffic_log.info(message)
+                        self.event_queue.put(("state", f"reconnecting|{message}"))
+                    gw = open_serial(gw_settings)
+                    traffic_log.info(f"Opened GasWorks-side port {gw.port}")
+                    pl = open_serial(pl_settings)
+                    traffic_log.info(f"Opened ProLab-side port {pl.port}")
+                    t_gw_pl = threading.Thread(
+                        target=gw_to_pl_worker,
+                        name="gw-to-pl",
+                        args=(gw, pl, session_stop, traffic_log, cr_wait_s),
+                        daemon=True,
+                    )
+                    t_pl_gw = threading.Thread(
+                        target=pl_to_gw_worker,
+                        name="pl-to-gw",
+                        args=(pl, gw, session_stop, traffic_log),
+                        daemon=True,
+                    )
+                    t_gw_pl.start()
+                    t_pl_gw.start()
+                    traffic_log.info("Bridge running.")
+                    self.event_queue.put(("state", "running|Bridge running"))
+                    while not self.stop_event.wait(0.20):
+                        if session_stop.is_set() or not t_gw_pl.is_alive() or not t_pl_gw.is_alive():
+                            session_failed = True
+                            session_stop.set()
+                            break
+                except (SerialException, OSError, ValueError) as exc:
+                    session_failed = True
+                    traffic_log.error(f"Serial port error: {exc}")
+                except Exception as exc:
+                    session_failed = True
+                    traffic_log.error(f"Unexpected bridge error: {exc}")
+                finally:
+                    session_stop.set()
+                    for thread in (t_gw_pl, t_pl_gw):
+                        if thread is not None:
+                            thread.join(timeout=2.0)
+                    for port in (gw, pl):
+                        if port is not None and port.is_open:
+                            try:
+                                port.close()
+                            except OSError:
+                                pass
 
-            pl = open_serial(pl_settings)
-            traffic_log.info(f"Opened ProLab-side port {pl.port}")
-
-            t_gw_pl = threading.Thread(
-                target=gw_to_pl_worker,
-                name="gw-to-pl",
-                    args=(gw, pl, self.stop_event, traffic_log, cr_wait_s),
-                daemon=True,
-            )
-            t_pl_gw = threading.Thread(
-                target=pl_to_gw_worker,
-                name="pl-to-gw",
-                    args=(pl, gw, self.stop_event, traffic_log),
-                daemon=True,
-            )
-            t_gw_pl.start()
-            t_pl_gw.start()
-
-            traffic_log.info("Bridge running.")
-            self.event_queue.put(("state", "running|Bridge running"))
-
-            while not self.stop_event.wait(0.20):
-                if not t_gw_pl.is_alive() or not t_pl_gw.is_alive():
-                    failed = True
-                    self.stop_event.set()
+                if self.stop_event.is_set() or self._manual_stop:
                     break
-
-            t_gw_pl.join(timeout=2.0)
-            t_pl_gw.join(timeout=2.0)
-
-            if failed and not self._manual_stop:
-                traffic_log.error(
-                    "A serial bridge worker stopped unexpectedly. Check the traffic log above."
-                )
-
-        except (SerialException, OSError, ValueError) as exc:
-            failed = True
-            if traffic_log is not None:
-                traffic_log.error(f"Serial port error: {exc}")
-            else:
-                self.event_queue.put(("log", f"Serial port error: {exc}"))
-            self.event_queue.put(("state", f"error|{exc}"))
+                if not session_failed:
+                    break
+                if not auto_reconnect:
+                    terminal_error = True
+                    self.event_queue.put(("state", "error|Bridge stopped due to a serial error"))
+                    break
+                attempt += 1
+                self.event_queue.put((
+                    "state",
+                    f"reconnecting|Serial connection lost; retrying in {reconnect_delay_s:g} seconds",
+                ))
+                if self.stop_event.wait(reconnect_delay_s):
+                    break
         except Exception as exc:
-            failed = True
+            terminal_error = True
             if traffic_log is not None:
                 traffic_log.error(f"Unexpected bridge error: {exc}")
             else:
                 self.event_queue.put(("log", f"Unexpected bridge error: {exc}"))
             self.event_queue.put(("state", f"error|{exc}"))
         finally:
-            self.stop_event.set()
-
-            for port in (gw, pl):
-                if port is not None and port.is_open:
-                    try:
-                        port.close()
-                    except OSError:
-                        pass
-
             if traffic_log is not None:
                 traffic_log.info("Bridge stopped.")
                 if queue_handler is not None:
@@ -964,9 +1012,7 @@ class SerialBridgeController:
                     queue_handler.close()
                 traffic_log.close()
 
-            if failed and not self._manual_stop:
-                self.event_queue.put(("state", "error|Bridge stopped due to an error"))
-            else:
+            if not terminal_error:
                 self.event_queue.put(("state", "stopped|Bridge stopped"))
 
 
@@ -1000,15 +1046,25 @@ class ProLabTranslatorGUI:
         self.pl_port_var = tk.StringVar(value=str(saved.get("pl_port", "")))
         self.gw_baud_var = tk.StringVar(value=str(saved.get("gw_baud", "9600")))
         self.pl_baud_var = tk.StringVar(value=str(saved.get("pl_baud", "9600")))
-        self.bytesize_var = tk.StringVar(value=str(saved.get("bytesize", "8")))
-        self.parity_var = tk.StringVar(value=str(saved.get("parity", "N")))
-        self.stopbits_var = tk.StringVar(value=str(saved.get("stopbits", "1")))
+        # Fall back to the pre-per-port settings so existing installations keep
+        # their working serial profile on upgrade.
+        self.gw_bytesize_var = tk.StringVar(value=str(saved.get("gw_bytesize", saved.get("bytesize", "8"))))
+        self.pl_bytesize_var = tk.StringVar(value=str(saved.get("pl_bytesize", saved.get("bytesize", "8"))))
+        self.gw_parity_var = tk.StringVar(value=str(saved.get("gw_parity", saved.get("parity", "N"))))
+        self.pl_parity_var = tk.StringVar(value=str(saved.get("pl_parity", saved.get("parity", "N"))))
+        self.gw_stopbits_var = tk.StringVar(value=str(saved.get("gw_stopbits", saved.get("stopbits", "1"))))
+        self.pl_stopbits_var = tk.StringVar(value=str(saved.get("pl_stopbits", saved.get("stopbits", "1"))))
         self.read_timeout_var = tk.StringVar(value=str(saved.get("read_timeout_ms", "10")))
         self.cr_wait_var = tk.StringVar(value=str(saved.get("cr_wait_ms", "20")))
         self.write_timeout_var = tk.StringVar(value=str(saved.get("write_timeout", "2.0")))
-        self.xonxoff_var = tk.BooleanVar(value=bool(saved.get("xonxoff", False)))
-        self.rtscts_var = tk.BooleanVar(value=bool(saved.get("rtscts", False)))
-        self.dsrdtr_var = tk.BooleanVar(value=bool(saved.get("dsrdtr", False)))
+        self.gw_xonxoff_var = tk.BooleanVar(value=bool(saved.get("gw_xonxoff", saved.get("xonxoff", False))))
+        self.pl_xonxoff_var = tk.BooleanVar(value=bool(saved.get("pl_xonxoff", saved.get("xonxoff", False))))
+        self.gw_rtscts_var = tk.BooleanVar(value=bool(saved.get("gw_rtscts", saved.get("rtscts", False))))
+        self.pl_rtscts_var = tk.BooleanVar(value=bool(saved.get("pl_rtscts", saved.get("rtscts", False))))
+        self.gw_dsrdtr_var = tk.BooleanVar(value=bool(saved.get("gw_dsrdtr", saved.get("dsrdtr", False))))
+        self.pl_dsrdtr_var = tk.BooleanVar(value=bool(saved.get("pl_dsrdtr", saved.get("dsrdtr", False))))
+        self.auto_reconnect_var = tk.BooleanVar(value=bool(saved.get("auto_reconnect", True)))
+        self.reconnect_delay_var = tk.StringVar(value=str(saved.get("reconnect_delay_s", "3")))
         default_log_file = settings_directory() / "prolab_translator.log"
         self.log_file_var = tk.StringVar(
             value=str(saved.get("log_file") or default_log_file)
@@ -1090,76 +1146,55 @@ class ProLabTranslatorGUI:
         settings_frame = ttk.LabelFrame(outer, text="Serial / translator settings", padding=6)
         settings_frame.grid(row=3, column=0, sticky="ew", pady=(6, 6))
 
-        for col in range(8):
-            settings_frame.columnconfigure(col, weight=1 if col % 2 else 0)
+        settings_frame.columnconfigure(1, weight=1)
+        settings_frame.columnconfigure(2, weight=1)
+        ttk.Label(settings_frame, text="", width=14).grid(row=0, column=0)
+        ttk.Label(settings_frame, text="GasWorks side", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=1, sticky="w")
+        ttk.Label(settings_frame, text="ProLab side", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=2, sticky="w")
 
-        ttk.Label(settings_frame, text="Data bits").grid(row=0, column=0, sticky="w")
-        self.bytesize_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.bytesize_var,
-            values=("5", "6", "7", "8"),
-            state="readonly",
-            width=7,
-        )
-        self.bytesize_combo.grid(row=0, column=1, sticky="w", padx=(5, 14))
+        def side_combo(row: int, label: str, gw_var: tk.StringVar, pl_var: tk.StringVar, values: tuple[str, ...]) -> tuple[ttk.Combobox, ttk.Combobox]:
+            ttk.Label(settings_frame, text=label).grid(row=row, column=0, sticky="w", pady=(3, 0))
+            gw_combo = ttk.Combobox(settings_frame, textvariable=gw_var, values=values, state="readonly", width=8)
+            pl_combo = ttk.Combobox(settings_frame, textvariable=pl_var, values=values, state="readonly", width=8)
+            gw_combo.grid(row=row, column=1, sticky="w", pady=(3, 0))
+            pl_combo.grid(row=row, column=2, sticky="w", pady=(3, 0))
+            return gw_combo, pl_combo
 
-        ttk.Label(settings_frame, text="Parity").grid(row=0, column=2, sticky="w")
-        self.parity_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.parity_var,
-            values=("N", "E", "O", "M", "S"),
-            state="readonly",
-            width=7,
-        )
-        self.parity_combo.grid(row=0, column=3, sticky="w", padx=(5, 14))
+        self.gw_bytesize_combo, self.pl_bytesize_combo = side_combo(1, "Data bits", self.gw_bytesize_var, self.pl_bytesize_var, ("5", "6", "7", "8"))
+        self.gw_parity_combo, self.pl_parity_combo = side_combo(2, "Parity", self.gw_parity_var, self.pl_parity_var, ("N", "E", "O", "M", "S"))
+        self.gw_stopbits_combo, self.pl_stopbits_combo = side_combo(3, "Stop bits", self.gw_stopbits_var, self.pl_stopbits_var, ("1", "1.5", "2"))
 
-        ttk.Label(settings_frame, text="Stop bits").grid(row=0, column=4, sticky="w")
-        self.stopbits_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.stopbits_var,
-            values=("1", "1.5", "2"),
-            state="readonly",
-            width=7,
-        )
-        self.stopbits_combo.grid(row=0, column=5, sticky="w", padx=(5, 14))
+        def side_check(row: int, label: str, gw_var: tk.BooleanVar, pl_var: tk.BooleanVar) -> tuple[ttk.Checkbutton, ttk.Checkbutton]:
+            ttk.Label(settings_frame, text=label).grid(row=row, column=0, sticky="w", pady=(3, 0))
+            gw_check = ttk.Checkbutton(settings_frame, variable=gw_var)
+            pl_check = ttk.Checkbutton(settings_frame, variable=pl_var)
+            gw_check.grid(row=row, column=1, sticky="w", pady=(3, 0))
+            pl_check.grid(row=row, column=2, sticky="w", pady=(3, 0))
+            return gw_check, pl_check
 
-        ttk.Label(settings_frame, text="CR wait (ms)").grid(row=0, column=6, sticky="w")
-        self.cr_wait_entry = ttk.Entry(settings_frame, textvariable=self.cr_wait_var, width=9)
-        self.cr_wait_entry.grid(row=0, column=7, sticky="ew", padx=(5, 0))
+        self.gw_xonxoff_check, self.pl_xonxoff_check = side_check(4, "XON/XOFF", self.gw_xonxoff_var, self.pl_xonxoff_var)
+        self.gw_rtscts_check, self.pl_rtscts_check = side_check(5, "RTS/CTS", self.gw_rtscts_var, self.pl_rtscts_var)
+        self.gw_dsrdtr_check, self.pl_dsrdtr_check = side_check(6, "DSR/DTR", self.gw_dsrdtr_var, self.pl_dsrdtr_var)
 
-        ttk.Label(settings_frame, text="Read timeout (ms)").grid(
-            row=1, column=0, sticky="w", pady=(5, 0)
-        )
-        self.read_timeout_entry = ttk.Entry(
-            settings_frame, textvariable=self.read_timeout_var, width=9
-        )
-        self.read_timeout_entry.grid(row=1, column=1, sticky="ew", padx=(5, 10), pady=(5, 0))
-
-        ttk.Label(settings_frame, text="Write timeout (s)").grid(
-            row=1, column=2, sticky="w", pady=(5, 0)
-        )
-        self.write_timeout_entry = ttk.Entry(
-            settings_frame, textvariable=self.write_timeout_var, width=9
-        )
-        self.write_timeout_entry.grid(row=1, column=3, sticky="ew", padx=(5, 10), pady=(5, 0))
-
-        self.xonxoff_check = ttk.Checkbutton(
-            settings_frame, text="XON/XOFF", variable=self.xonxoff_var
-        )
-        self.xonxoff_check.grid(row=1, column=4, sticky="w", pady=(5, 0))
-
-        self.rtscts_check = ttk.Checkbutton(
-            settings_frame, text="RTS/CTS", variable=self.rtscts_var
-        )
-        self.rtscts_check.grid(row=1, column=5, sticky="w", pady=(5, 0))
-
-        self.dsrdtr_check = ttk.Checkbutton(
-            settings_frame, text="DSR/DTR", variable=self.dsrdtr_var
-        )
-        self.dsrdtr_check.grid(row=1, column=6, sticky="w", pady=(5, 0))
+        timing_frame = ttk.Frame(settings_frame)
+        timing_frame.grid(row=1, column=3, rowspan=6, sticky="nsew", padx=(14, 0))
+        ttk.Label(timing_frame, text="CR wait (ms)").grid(row=0, column=0, sticky="w")
+        self.cr_wait_entry = ttk.Entry(timing_frame, textvariable=self.cr_wait_var, width=9)
+        self.cr_wait_entry.grid(row=0, column=1, sticky="w", padx=(5, 0))
+        ttk.Label(timing_frame, text="Read timeout (ms)").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.read_timeout_entry = ttk.Entry(timing_frame, textvariable=self.read_timeout_var, width=9)
+        self.read_timeout_entry.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(4, 0))
+        ttk.Label(timing_frame, text="Write timeout (s)").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.write_timeout_entry = ttk.Entry(timing_frame, textvariable=self.write_timeout_var, width=9)
+        self.write_timeout_entry.grid(row=2, column=1, sticky="w", padx=(5, 0), pady=(4, 0))
+        self.auto_reconnect_check = ttk.Checkbutton(timing_frame, text="Auto reconnect", variable=self.auto_reconnect_var)
+        self.auto_reconnect_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(timing_frame, text="Retry delay (s)").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self.reconnect_delay_entry = ttk.Entry(timing_frame, textvariable=self.reconnect_delay_var, width=9)
+        self.reconnect_delay_entry.grid(row=4, column=1, sticky="w", padx=(5, 0), pady=(4, 0))
 
         log_frame = ttk.Frame(settings_frame)
-        log_frame.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(6, 0))
+        log_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         log_frame.columnconfigure(1, weight=1)
         ttk.Label(log_frame, text="Log file").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.log_entry = ttk.Entry(log_frame, textvariable=self.log_file_var)
@@ -1216,15 +1251,17 @@ class ProLabTranslatorGUI:
             self.pl_port_combo,
             self.gw_baud_combo,
             self.pl_baud_combo,
-            self.bytesize_combo,
-            self.parity_combo,
-            self.stopbits_combo,
+            self.gw_bytesize_combo, self.pl_bytesize_combo,
+            self.gw_parity_combo, self.pl_parity_combo,
+            self.gw_stopbits_combo, self.pl_stopbits_combo,
             self.cr_wait_entry,
             self.read_timeout_entry,
             self.write_timeout_entry,
-            self.xonxoff_check,
-            self.rtscts_check,
-            self.dsrdtr_check,
+            self.gw_xonxoff_check, self.pl_xonxoff_check,
+            self.gw_rtscts_check, self.pl_rtscts_check,
+            self.gw_dsrdtr_check, self.pl_dsrdtr_check,
+            self.auto_reconnect_check,
+            self.reconnect_delay_entry,
             self.log_entry,
             self.browse_button,
             self.refresh_button,
@@ -1277,15 +1314,23 @@ class ProLabTranslatorGUI:
                 "pl_port": self._device_from_combo_text(self.pl_port_var.get()),
                 "gw_baud": self.gw_baud_var.get(),
                 "pl_baud": self.pl_baud_var.get(),
-                "bytesize": self.bytesize_var.get(),
-                "parity": self.parity_var.get(),
-                "stopbits": self.stopbits_var.get(),
+                "gw_bytesize": self.gw_bytesize_var.get(),
+                "pl_bytesize": self.pl_bytesize_var.get(),
+                "gw_parity": self.gw_parity_var.get(),
+                "pl_parity": self.pl_parity_var.get(),
+                "gw_stopbits": self.gw_stopbits_var.get(),
+                "pl_stopbits": self.pl_stopbits_var.get(),
                 "read_timeout_ms": self.read_timeout_var.get(),
                 "cr_wait_ms": self.cr_wait_var.get(),
                 "write_timeout": self.write_timeout_var.get(),
-                "xonxoff": self.xonxoff_var.get(),
-                "rtscts": self.rtscts_var.get(),
-                "dsrdtr": self.dsrdtr_var.get(),
+                "gw_xonxoff": self.gw_xonxoff_var.get(),
+                "pl_xonxoff": self.pl_xonxoff_var.get(),
+                "gw_rtscts": self.gw_rtscts_var.get(),
+                "pl_rtscts": self.pl_rtscts_var.get(),
+                "gw_dsrdtr": self.gw_dsrdtr_var.get(),
+                "pl_dsrdtr": self.pl_dsrdtr_var.get(),
+                "auto_reconnect": self.auto_reconnect_var.get(),
+                "reconnect_delay_s": self.reconnect_delay_var.get(),
                 "log_file": self.log_file_var.get(),
             },
         )
@@ -1301,8 +1346,8 @@ class ProLabTranslatorGUI:
         if path:
             self.log_file_var.set(path)
 
-    def _parse_stopbits(self) -> float:
-        value = self.stopbits_var.get().strip()
+    def _parse_stopbits(self, value: str) -> float:
+        value = value.strip()
         mapping = {
             "1": serial.STOPBITS_ONE,
             "1.0": serial.STOPBITS_ONE,
@@ -1325,12 +1370,16 @@ class ProLabTranslatorGUI:
 
         gw_baud = int(self.gw_baud_var.get())
         pl_baud = int(self.pl_baud_var.get())
-        bytesize = int(self.bytesize_var.get())
-        parity = self.parity_var.get().strip().upper()
-        stopbits = self._parse_stopbits()
+        gw_bytesize = int(self.gw_bytesize_var.get())
+        pl_bytesize = int(self.pl_bytesize_var.get())
+        gw_parity = self.gw_parity_var.get().strip().upper()
+        pl_parity = self.pl_parity_var.get().strip().upper()
+        gw_stopbits = self._parse_stopbits(self.gw_stopbits_var.get())
+        pl_stopbits = self._parse_stopbits(self.pl_stopbits_var.get())
         read_timeout_ms = float(self.read_timeout_var.get())
         cr_wait_ms = float(self.cr_wait_var.get())
         write_timeout = float(self.write_timeout_var.get())
+        reconnect_delay_s = float(self.reconnect_delay_var.get())
 
         if gw_baud <= 0 or pl_baud <= 0:
             raise ValueError("Baud rates must be greater than zero")
@@ -1338,26 +1387,32 @@ class ProLabTranslatorGUI:
             raise ValueError("Timeout values cannot be negative")
         if write_timeout <= 0:
             raise ValueError("Write timeout must be greater than zero")
+        if reconnect_delay_s <= 0:
+            raise ValueError("Reconnect delay must be greater than zero")
 
         common = dict(
-            bytesize=bytesize,
-            parity=parity,
-            stopbits=stopbits,
             timeout=read_timeout_ms / 1000.0,
             write_timeout=write_timeout,
-            xonxoff=self.xonxoff_var.get(),
-            rtscts=self.rtscts_var.get(),
-            dsrdtr=self.dsrdtr_var.get(),
         )
 
-        gw_settings = PortSettings(port=gw_port, baudrate=gw_baud, **common)
-        pl_settings = PortSettings(port=pl_port, baudrate=pl_baud, **common)
-        log_file = self.log_file_var.get().strip() or None
-        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file
+        gw_settings = PortSettings(
+            port=gw_port, baudrate=gw_baud, bytesize=gw_bytesize,
+            parity=gw_parity, stopbits=gw_stopbits,
+            xonxoff=self.gw_xonxoff_var.get(), rtscts=self.gw_rtscts_var.get(),
+            dsrdtr=self.gw_dsrdtr_var.get(), **common,
+        )
+        pl_settings = PortSettings(
+            port=pl_port, baudrate=pl_baud, bytesize=pl_bytesize,
+            parity=pl_parity, stopbits=pl_stopbits,
+            xonxoff=self.pl_xonxoff_var.get(), rtscts=self.pl_rtscts_var.get(),
+            dsrdtr=self.pl_dsrdtr_var.get(), **common,
+        )
+        log_file = session_log_path(self.log_file_var.get().strip() or None)
+        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s
 
     def start_bridge(self) -> None:
         try:
-            gw_settings, pl_settings, cr_wait_s, log_file = self._build_settings()
+            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s = self._build_settings()
         except (ValueError, TypeError) as exc:
             messagebox.showerror("Invalid settings", str(exc), parent=self.root)
             return
@@ -1365,7 +1420,7 @@ class ProLabTranslatorGUI:
         self.status_var.set("Starting...")
         self._set_running_ui(True)
         try:
-            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file)
+            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s)
             self._save_settings()
         except Exception as exc:
             self._set_running_ui(False)
@@ -1382,7 +1437,11 @@ class ProLabTranslatorGUI:
                     widget.configure(state="disabled")
                 else:
                     # Restore the intended state for the read-only combo boxes.
-                    if widget in (self.bytesize_combo, self.parity_combo, self.stopbits_combo):
+                    if widget in (
+                        self.gw_bytesize_combo, self.pl_bytesize_combo,
+                        self.gw_parity_combo, self.pl_parity_combo,
+                        self.gw_stopbits_combo, self.pl_stopbits_combo,
+                    ):
                         widget.configure(state="readonly")
                     else:
                         widget.configure(state="normal")
