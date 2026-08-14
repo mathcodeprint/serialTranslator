@@ -6,7 +6,7 @@ A small Python/pySerial bridge that fixes the serial command terminator mismatch
 - **ProLab expects:** `CR LF` (`0D 0A`)
 - **ProLab responses:** forwarded back to GasWorks **byte-for-byte unchanged**
 
-## Correct com0com topology
+## Windows virtual COM ports (com0com)
 
 A com0com pair has two ends. GasWorks and this translator must open **different ends** of the pair.
 
@@ -27,6 +27,38 @@ Recommended example:
 - Physical ProLab analyzer: **COM4**
 
 Do **not** configure GasWorks and the translator to both open COM5.
+
+### When com0com is needed
+
+Install com0com on Windows when GasWorks and the translator run on the same PC
+and GasWorks must communicate through a COM port: it supplies the virtual
+null-modem pair that lets each application open a separate endpoint. It is also
+needed for the Windows **Simulate Traffic** test bench, which needs two pairs.
+
+It is not needed on Linux for the built-in simulation (the application creates
+temporary PTYs with `socat`), and it is not needed for a physical ProLab port.
+The ProLab side should use the actual USB/RS-232 COM port assigned by Windows.
+
+### Install and configure com0com
+
+1. Download com0com from its [SourceForge project page](https://sourceforge.net/projects/com0com/), then run the installer as an administrator.
+2. On Windows 10/11, confirm that the driver installed successfully in Device
+   Manager. Older builds may be rejected by modern driver-signing protections;
+   do not disable Windows security features just to proceed—use a version whose
+   driver is trusted by your organization instead.
+3. Open **Setup Command Prompt** from the com0com Start-menu group and create a
+   pair. For the production topology above, create a pair with endpoints named
+   `COM5` and `COM6`. Use the com0com setup GUI instead if you prefer.
+4. Restart GasWorks/the translator if either was open, then select the two
+   endpoints as shown above.
+
+For the Windows simulator, create two pairs, for example `COM5` ↔ `COM6` and
+`COM7` ↔ `COM8`. Select `COM5` in the fake GasWorks client and `COM8` in the
+fake ProLab client; select `COM6` and `COM7` respectively in the translator.
+
+The com0com project documents that its installer initially provides the internal
+`CNCA0`/`CNCB0` pair and that additional pairs can be created using its setup
+tools. [com0com documentation](https://github.com/tanvir-ahmed-m4/com0com)
 
 ## Install
 
