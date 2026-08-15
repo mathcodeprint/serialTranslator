@@ -121,6 +121,21 @@ by default. The status changes to **Reconnecting** while it retries; use
 **Stop Bridge** to stop retrying, or turn off **Auto reconnect** for a
 single-attempt session.
 
+On Windows, **Start bridge at sign-in** adds a per-user Startup entry. At the
+next sign-in it opens the normal application and starts the bridge with the
+saved settings; automatic reconnect keeps retrying until the configured COM
+ports become available. This does not require administrator rights and is not a
+Windows Service.
+
+Use **Start minimized** to hide the window at launch. On Windows, the
+notification-area icon is green while the bridge is active and red otherwise;
+use its **Show** or **Quit** menu actions to restore or close the application.
+
+Linux Mint uses the same green/red notification-area icon and **Show**/**Quit**
+menu. Install the project dependencies with `python3 -m pip install -r
+requirements.txt`; if the icon is not visible, enable Mint's notification-area
+applet for the current desktop panel.
+
 ## Simulate traffic without instruments
 
 On Linux, use the **Simulate Traffic** button in the main GUI. It starts the

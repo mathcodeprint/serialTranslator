@@ -31,6 +31,7 @@ from serial.tools import list_ports
 
 
 APP_NAME = "GasWorks-ProLab Serial Translator"
+WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
 
 
 def session_log_path(log_file: Optional[str], now: Optional[datetime] = None) -> Optional[str]:
@@ -41,6 +42,43 @@ def session_log_path(log_file: Optional[str], now: Optional[datetime] = None) ->
     timestamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
     suffix = path.suffix or ".log"
     return str(path.with_name(f"{path.stem}_{timestamp}{suffix}"))
+
+
+def windows_startup_command() -> str:
+    """Return a quoted command that starts this installed app after user sign-in."""
+    if getattr(sys, "frozen", False):
+        return subprocess.list2cmdline([sys.executable, "--gui", "--autostart", "--start-minimized"])
+    return subprocess.list2cmdline([sys.executable, str(Path(__file__).resolve()), "--gui", "--autostart", "--start-minimized"])
+
+
+def set_windows_startup(enabled: bool) -> None:
+    """Enable/disable the current user's Windows startup entry."""
+    if not is_windows():
+        raise RuntimeError("Windows startup is available on Windows only.")
+    import winreg
+
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, WINDOWS_STARTUP_VALUE, 0, winreg.REG_SZ, windows_startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, WINDOWS_STARTUP_VALUE)
+            except FileNotFoundError:
+                pass
+
+
+def windows_startup_enabled() -> bool:
+    if not is_windows():
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
+            winreg.QueryValueEx(key, WINDOWS_STARTUP_VALUE)
+            return True
+    except FileNotFoundError:
+        return False
 
 
 def ascii_view(data: bytes) -> str:
@@ -823,6 +861,46 @@ COMMON_BAUD_RATES = (
 )
 
 
+class TrayIcon:
+    """Small notification-area indicator for Windows and Linux desktop sessions."""
+    def __init__(self, root: tk.Tk, on_quit: callable) -> None:
+        self.root, self.on_quit, self.icon = root, on_quit, None
+        if not (is_windows() or is_linux()):
+            return
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+            self.pystray, self.Image, self.ImageDraw = pystray, Image, ImageDraw
+            self.icon = pystray.Icon("GasWorksProLabTranslator", self._image(False), APP_NAME)
+            self.icon.menu = pystray.Menu(
+                pystray.MenuItem("Show", self._show), pystray.MenuItem("Quit", self._quit)
+            )
+            threading.Thread(target=self.icon.run, daemon=True).start()
+        except ImportError:
+            self.icon = None
+
+    def _image(self, active: bool):
+        image = self.Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+        draw = self.ImageDraw.Draw(image)
+        draw.ellipse((3, 3, 29, 29), fill=(30, 150, 70, 255) if active else (180, 45, 45, 255))
+        return image
+
+    def set_active(self, active: bool) -> None:
+        if self.icon:
+            self.icon.icon = self._image(active)
+            self.icon.title = f"{APP_NAME}: {'Active' if active else 'Inactive'}"
+
+    def _show(self, *_args) -> None:
+        self.root.after(0, lambda: (self.root.deiconify(), self.root.lift()))
+
+    def _quit(self, *_args) -> None:
+        self.root.after(0, self.on_quit)
+
+    def close(self) -> None:
+        if self.icon:
+            self.icon.stop()
+
+
 class QueueLogHandler(logging.Handler):
     """Send formatted Python logging records to a thread-safe queue."""
 
@@ -1033,6 +1111,7 @@ class ProLabTranslatorGUI:
         self.saved_settings = load_settings("translator_gui")
 
         self._make_variables()
+        self.tray = TrayIcon(self.root, self.on_close)
         self._build_ui()
         self.refresh_ports()
         self._set_running_ui(False)
@@ -1065,6 +1144,7 @@ class ProLabTranslatorGUI:
         self.pl_dsrdtr_var = tk.BooleanVar(value=bool(saved.get("pl_dsrdtr", saved.get("dsrdtr", False))))
         self.auto_reconnect_var = tk.BooleanVar(value=bool(saved.get("auto_reconnect", True)))
         self.reconnect_delay_var = tk.StringVar(value=str(saved.get("reconnect_delay_s", "3")))
+        self.start_minimized_var = tk.BooleanVar(value=bool(saved.get("start_minimized", False)))
         default_log_file = settings_directory() / "prolab_translator.log"
         self.log_file_var = tk.StringVar(
             value=str(saved.get("log_file") or default_log_file)
@@ -1240,11 +1320,18 @@ class ProLabTranslatorGUI:
         )
         self.simulate_button.grid(row=0, column=3, padx=(6, 0))
 
-        ttk.Label(controls, text="Status:").grid(row=0, column=4, padx=(12, 4))
+        self.startup_button = ttk.Button(controls, command=self.toggle_windows_startup)
+        self.startup_button.grid(row=0, column=4, padx=(6, 0))
+        self._refresh_startup_button()
+
+        self.minimized_check = ttk.Checkbutton(controls, text="Start minimized", variable=self.start_minimized_var)
+        self.minimized_check.grid(row=0, column=5, padx=(6, 0))
+
+        ttk.Label(controls, text="Status:").grid(row=0, column=6, padx=(12, 4))
         self.status_label = ttk.Label(
             controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold")
         )
-        self.status_label.grid(row=0, column=5, sticky="e")
+        self.status_label.grid(row=0, column=7, sticky="e")
 
         self.config_widgets = [
             self.gw_port_combo,
@@ -1262,6 +1349,7 @@ class ProLabTranslatorGUI:
             self.gw_dsrdtr_check, self.pl_dsrdtr_check,
             self.auto_reconnect_check,
             self.reconnect_delay_entry,
+            self.minimized_check,
             self.log_entry,
             self.browse_button,
             self.refresh_button,
@@ -1331,6 +1419,7 @@ class ProLabTranslatorGUI:
                 "pl_dsrdtr": self.pl_dsrdtr_var.get(),
                 "auto_reconnect": self.auto_reconnect_var.get(),
                 "reconnect_delay_s": self.reconnect_delay_var.get(),
+                "start_minimized": self.start_minimized_var.get(),
                 "log_file": self.log_file_var.get(),
             },
         )
@@ -1430,6 +1519,22 @@ class ProLabTranslatorGUI:
     def stop_bridge(self) -> None:
         self.controller.stop()
 
+    def _refresh_startup_button(self) -> None:
+        if is_windows():
+            self.startup_button.configure(
+                text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in"
+            )
+        else:
+            self.startup_button.configure(text="Start at sign-in (Windows)", state="disabled")
+
+    def toggle_windows_startup(self) -> None:
+        try:
+            set_windows_startup(not windows_startup_enabled())
+            self._save_settings()
+            self._refresh_startup_button()
+        except (OSError, RuntimeError) as exc:
+            messagebox.showerror("Start at sign-in", str(exc), parent=self.root)
+
     def _set_running_ui(self, running: bool) -> None:
         for widget in self.config_widgets:
             try:
@@ -1513,8 +1618,10 @@ class ProLabTranslatorGUI:
                     self.status_var.set(message or state.title())
                     if state == "running":
                         self._set_running_ui(True)
+                        self.tray.set_active(True)
                     elif state in ("stopped", "error"):
                         self._set_running_ui(False)
+                        self.tray.set_active(False)
                         if state == "error" and message:
                             # Keep errors visible in the traffic pane without
                             # creating repeated modal dialogs from worker threads.
@@ -1533,14 +1640,19 @@ class ProLabTranslatorGUI:
         self.test_clients.clear()
         if self.test_bench is not None:
             self.test_bench.close()
+        self.tray.close()
         self.root.destroy()
 
 
-def gui_main(start_test_bench: bool = False) -> None:
+def gui_main(start_test_bench: bool = False, autostart: bool = False, start_minimized: bool = False) -> None:
     root = tk.Tk()
     app = ProLabTranslatorGUI(root)
     if start_test_bench:
         root.after_idle(app.start_simulated_test_bench)
+    elif autostart:
+        root.after_idle(app.start_bridge)
+    if start_minimized:
+        root.after_idle(root.withdraw)
     root.mainloop()
 
 
@@ -1839,10 +1951,16 @@ class ProLabTestClient(BaseTestClient):
 if __name__ == "__main__":
     if getattr(sys, "frozen", False) or "--gui" in sys.argv[1:]:
         start_test_bench = "--start-test-bench" in sys.argv[1:]
+        autostart = "--autostart" in sys.argv[1:]
+        start_minimized = "--start-minimized" in sys.argv[1:]
         if "--gui" in sys.argv:
             sys.argv.remove("--gui")
         if "--start-test-bench" in sys.argv:
             sys.argv.remove("--start-test-bench")
-        gui_main(start_test_bench=start_test_bench)
+        if "--autostart" in sys.argv:
+            sys.argv.remove("--autostart")
+        if "--start-minimized" in sys.argv:
+            sys.argv.remove("--start-minimized")
+        gui_main(start_test_bench=start_test_bench, autostart=autostart, start_minimized=start_minimized)
     else:
         raise SystemExit(main())

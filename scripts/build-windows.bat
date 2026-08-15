@@ -11,6 +11,8 @@ if errorlevel 1 exit /b 1
 py -m PyInstaller --noconfirm --clean --windowed --onedir ^
   --name "GasWorks-ProLab-Serial-Translator" ^
   --collect-all serial ^
+  --collect-all pystray ^
+  --collect-all PIL ^
   translator.py
 if errorlevel 1 exit /b 1
 
