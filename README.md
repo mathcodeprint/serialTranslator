@@ -102,6 +102,16 @@ Start Menu shortcut and can optionally create a Desktop shortcut. It does not
 install com0com; install and configure that separately only when your topology
 needs virtual COM-port pairs.
 
+To download the official Inno Setup installer and build without opening a web
+browser, run:
+
+```bat
+scripts\download-inno-setup-and-build-installer.bat
+```
+
+It uses PowerShell to download Inno Setup 6.7.3 from its official GitHub release
+and installs it silently. On Windows 7, TLS 1.2 must be enabled and available.
+
 ### Windows 7 / Python 3.7 builds
 
 `scripts\build-windows.bat` detects Python 3.7 and automatically uses the
