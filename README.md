@@ -88,6 +88,20 @@ current user's application-settings directory, not beside the installed `.exe`.
 Every bridge start creates a separate timestamped session log; each session log
 still rotates at 5 MiB with three retained backups.
 
+### Build a Windows installer
+
+Install [Inno Setup 6](https://jrsoftware.org/isdl.php) on Windows, then run:
+
+```bat
+scripts\build-windows-installer.bat
+```
+
+It builds the application bundle and produces
+`dist-installer\Serial-Protocol-Translator-Setup.exe`. The installer creates a
+Start Menu shortcut and can optionally create a Desktop shortcut. It does not
+install com0com; install and configure that separately only when your topology
+needs virtual COM-port pairs.
+
 ## See available ports
 
 ```powershell
@@ -135,6 +149,24 @@ Linux Mint uses the same green/red notification-area icon and **Show**/**Quit**
 menu. Install the project dependencies with `python3 -m pip install -r
 requirements.txt`; if the icon is not visible, enable Mint's notification-area
 applet for the current desktop panel.
+
+## Install on Linux Mint
+
+From the project directory, install a per-user launcher and menu entry:
+
+```bash
+scripts/install-linux-mint.sh
+```
+
+It creates a virtual environment under `~/.local/share/serial-protocol-translator`
+and adds **Serial Protocol Translator** to the Mint application menu. If Mint's
+tray backend packages are missing, install them (administrator password needed):
+
+```bash
+scripts/install-linux-mint.sh --system-deps
+```
+
+Then enable Cinnamon's **System Tray** panel applet if it is not already visible.
 
 ## Simulate traffic without instruments
 

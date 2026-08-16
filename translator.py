@@ -30,7 +30,8 @@ from serial import SerialException
 from serial.tools import list_ports
 
 
-APP_NAME = "GasWorks-ProLab Serial Translator"
+APP_NAME = "Serial Protocol Translator"
+TEMPLATES = {"Generic bidirectional": False, "GasWorks ↔ ProLab": True}
 WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
 
 
@@ -226,6 +227,12 @@ class CrLfNormalizer:
         return b"\r\n", True
 
 
+class PassThroughNormalizer:
+    pending_cr = False
+    def feed(self, data: bytes) -> tuple[bytes, bool]: return data, False
+    def flush_pending(self) -> tuple[bytes, bool]: return b"", False
+
+
 def simulated_traffic() -> list[tuple[str, bytes, str]]:
     """Return a representative in-process bridge exchange for demonstration."""
     command = b"SN -c01\r"
@@ -307,8 +314,9 @@ def gw_to_pl_worker(
     traffic_log: TrafficLogger,
     cr_wait_s: float,
     error_event: Optional[threading.Event] = None,
+    normalize_cr: bool = True,
 ) -> None:
-    normalizer = CrLfNormalizer()
+    normalizer = CrLfNormalizer() if normalize_cr else PassThroughNormalizer()
     pending_since: Optional[float] = None
 
     try:
@@ -839,7 +847,7 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Optional
 
 import serial
@@ -938,6 +946,7 @@ class SerialBridgeController:
         log_file: Optional[str],
         auto_reconnect: bool,
         reconnect_delay_s: float,
+        normalize_cr: bool = True,
     ) -> None:
         with self._lock:
             if self.running:
@@ -950,7 +959,7 @@ class SerialBridgeController:
                 name="bridge-supervisor",
                 args=(
                     gw_settings, pl_settings, cr_wait_s, log_file,
-                    auto_reconnect, reconnect_delay_s,
+                    auto_reconnect, reconnect_delay_s, normalize_cr,
                 ),
                 daemon=True,
             )
@@ -972,6 +981,7 @@ class SerialBridgeController:
         log_file: Optional[str],
         auto_reconnect: bool,
         reconnect_delay_s: float,
+        normalize_cr: bool,
     ) -> None:
         queue_handler: Optional[QueueLogHandler] = None
         traffic_log: Optional[TrafficLogger] = None
@@ -1024,7 +1034,7 @@ class SerialBridgeController:
                     t_gw_pl = threading.Thread(
                         target=gw_to_pl_worker,
                         name="gw-to-pl",
-                        args=(gw, pl, session_stop, traffic_log, cr_wait_s),
+                        args=(gw, pl, session_stop, traffic_log, cr_wait_s, None, normalize_cr),
                         daemon=True,
                     )
                     t_pl_gw = threading.Thread(
@@ -1109,6 +1119,7 @@ class ProLabTranslatorGUI:
         self.test_clients: list[BaseTestClient] = []
         self.port_display_to_device: dict[str, str] = {}
         self.saved_settings = load_settings("translator_gui")
+        self.profiles = load_settings("translator_profiles")
 
         self._make_variables()
         self.tray = TrayIcon(self.root, self.on_close)
@@ -1122,6 +1133,8 @@ class ProLabTranslatorGUI:
     def _make_variables(self) -> None:
         saved = self.saved_settings
         self.gw_port_var = tk.StringVar(value=str(saved.get("gw_port", "")))
+        self.template_var = tk.StringVar(value=str(saved.get("template", "Generic bidirectional")))
+        self.profile_var = tk.StringVar()
         self.pl_port_var = tk.StringVar(value=str(saved.get("pl_port", "")))
         self.gw_baud_var = tk.StringVar(value=str(saved.get("gw_baud", "9600")))
         self.pl_baud_var = tk.StringVar(value=str(saved.get("pl_baud", "9600")))
@@ -1152,6 +1165,7 @@ class ProLabTranslatorGUI:
         self.status_var = tk.StringVar(value="Stopped")
 
     def _build_ui(self) -> None:
+        self._build_menu()
         outer = ttk.Frame(self.root, padding=6)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
@@ -1159,7 +1173,7 @@ class ProLabTranslatorGUI:
 
         title = ttk.Label(
             outer,
-            text="GasWorks ↔ ProLab Serial Translator",
+            text="Serial Protocol Translator",
             font=("Segoe UI", 13, "bold"),
         )
         title.grid(row=0, column=0, sticky="w")
@@ -1167,8 +1181,7 @@ class ProLabTranslatorGUI:
         topology = ttk.Label(
             outer,
             text=(
-                "Typical connection: GasWorks COM5 ↔ com0com ↔ COM6 "
-                "[translator] COM4 ↔ ProLab"
+                "Bidirectional serial bridge. Choose a template or save a reusable profile."
             ),
         )
         topology.grid(row=1, column=0, sticky="w", pady=(1, 6))
@@ -1178,7 +1191,7 @@ class ProLabTranslatorGUI:
         ports_frame.columnconfigure(1, weight=1)
         ports_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(ports_frame, text="GasWorks-side port").grid(
+        ttk.Label(ports_frame, text="Source port").grid(
             row=0, column=0, sticky="w", padx=(0, 6), pady=3
         )
         self.gw_port_combo = ttk.Combobox(
@@ -1186,7 +1199,7 @@ class ProLabTranslatorGUI:
         )
         self.gw_port_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=2)
 
-        ttk.Label(ports_frame, text="GasWorks baud").grid(
+        ttk.Label(ports_frame, text="Source baud").grid(
             row=0, column=2, sticky="w", padx=(0, 6), pady=3
         )
         self.gw_baud_combo = ttk.Combobox(
@@ -1198,7 +1211,7 @@ class ProLabTranslatorGUI:
         )
         self.gw_baud_combo.grid(row=0, column=3, sticky="ew", pady=2)
 
-        ttk.Label(ports_frame, text="ProLab port").grid(
+        ttk.Label(ports_frame, text="Destination port").grid(
             row=1, column=0, sticky="w", padx=(0, 6), pady=3
         )
         self.pl_port_combo = ttk.Combobox(
@@ -1206,7 +1219,7 @@ class ProLabTranslatorGUI:
         )
         self.pl_port_combo.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=2)
 
-        ttk.Label(ports_frame, text="ProLab baud").grid(
+        ttk.Label(ports_frame, text="Destination baud").grid(
             row=1, column=2, sticky="w", padx=(0, 6), pady=3
         )
         self.pl_baud_combo = ttk.Combobox(
@@ -1355,6 +1368,35 @@ class ProLabTranslatorGUI:
             self.refresh_button,
         ]
 
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self.root)
+        file_menu = tk.Menu(menu, tearoff=False)
+        templates = tk.Menu(file_menu, tearoff=False)
+        for name in TEMPLATES:
+            templates.add_radiobutton(label=name, variable=self.template_var, value=name)
+        file_menu.add_cascade(label="Template", menu=templates)
+        profiles = tk.Menu(file_menu, tearoff=False)
+        for name in self.profiles:
+            profiles.add_command(label=name, command=lambda n=name: self.load_profile(n))
+        file_menu.add_cascade(label="Open Profile", menu=profiles)
+        file_menu.add_command(label="Save Profile…", command=self.save_profile)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+        menu.add_cascade(label="File", menu=file_menu)
+        edit_menu = tk.Menu(menu, tearoff=False)
+        edit_menu.add_command(label="Clear Traffic", command=self.clear_traffic)
+        edit_menu.add_command(label="Copy Traffic", state="disabled")
+        edit_menu.add_command(label="Preferences…", state="disabled")
+        menu.add_cascade(label="Edit", menu=edit_menu)
+        view_menu = tk.Menu(menu, tearoff=False)
+        view_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
+        view_menu.add_command(label="Show in Tray", state="disabled")
+        menu.add_cascade(label="View", menu=view_menu)
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", APP_NAME, parent=self.root))
+        menu.add_cascade(label="Help", menu=help_menu)
+        self.root.configure(menu=menu)
+
     def _device_from_combo_text(self, value: str) -> str:
         value = value.strip()
         if value in self.port_display_to_device:
@@ -1399,6 +1441,7 @@ class ProLabTranslatorGUI:
             "translator_gui",
             {
                 "gw_port": self._device_from_combo_text(self.gw_port_var.get()),
+                "template": self.template_var.get(),
                 "pl_port": self._device_from_combo_text(self.pl_port_var.get()),
                 "gw_baud": self.gw_baud_var.get(),
                 "pl_baud": self.pl_baud_var.get(),
@@ -1423,6 +1466,26 @@ class ProLabTranslatorGUI:
                 "log_file": self.log_file_var.get(),
             },
         )
+
+    def save_profile(self) -> None:
+        name = simpledialog.askstring("Save profile", "Profile name:", parent=self.root)
+        name = (name or "").strip()
+        if not name:
+            messagebox.showerror("Save profile", "Enter a profile name first.", parent=self.root)
+            return
+        self._save_settings()
+        self.profiles[name] = load_settings("translator_gui")
+        save_settings("translator_profiles", self.profiles)
+
+    def load_profile(self, name: str) -> None:
+        profile = self.profiles.get(name)
+        if not profile:
+            messagebox.showerror("Load profile", "Select a saved profile.", parent=self.root)
+            return
+        for key, variable in (("gw_port", self.gw_port_var), ("pl_port", self.pl_port_var), ("template", self.template_var), ("gw_baud", self.gw_baud_var), ("pl_baud", self.pl_baud_var)):
+            if key in profile:
+                variable.set(str(profile[key]))
+        self.refresh_ports()
 
     def choose_log_file(self) -> None:
         current = self.log_file_var.get().strip() or "prolab_translator.log"
@@ -1497,11 +1560,11 @@ class ProLabTranslatorGUI:
             dsrdtr=self.pl_dsrdtr_var.get(), **common,
         )
         log_file = session_log_path(self.log_file_var.get().strip() or None)
-        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s
+        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False)
 
     def start_bridge(self) -> None:
         try:
-            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s = self._build_settings()
+            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr = self._build_settings()
         except (ValueError, TypeError) as exc:
             messagebox.showerror("Invalid settings", str(exc), parent=self.root)
             return
@@ -1509,7 +1572,7 @@ class ProLabTranslatorGUI:
         self.status_var.set("Starting...")
         self._set_running_ui(True)
         try:
-            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s)
+            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr)
             self._save_settings()
         except Exception as exc:
             self._set_running_ui(False)
