@@ -102,6 +102,14 @@ Start Menu shortcut and can optionally create a Desktop shortcut. It does not
 install com0com; install and configure that separately only when your topology
 needs virtual COM-port pairs.
 
+### Windows 7 / Python 3.7 builds
+
+`scripts\build-windows.bat` detects Python 3.7 and automatically uses the
+Windows-7-compatible build dependencies (`PyInstaller 5.13.2` and Pillow 9.5).
+Use the 32-bit or 64-bit Python 3.7 interpreter that matches the target Windows
+installation. Windows 7 is legacy and should be isolated and kept offline where
+practical.
+
 ## See available ports
 
 ```powershell

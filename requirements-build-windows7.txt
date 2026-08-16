@@ -1,0 +1,3 @@
+# Last compatible build toolchain for Windows 7 / Python 3.7.
+-r requirements-windows7.txt
+pyinstaller==5.13.2

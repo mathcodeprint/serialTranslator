@@ -835,7 +835,8 @@ def save_settings(name: str, data: dict) -> None:
     except OSError:
         # Settings persistence should never stop the serial application.
         try:
-            temp.unlink(missing_ok=True)
+            if temp.exists():
+                temp.unlink()
         except OSError:
             pass
 
@@ -1386,16 +1387,74 @@ class ProLabTranslatorGUI:
         edit_menu = tk.Menu(menu, tearoff=False)
         edit_menu.add_command(label="Clear Traffic", command=self.clear_traffic)
         edit_menu.add_command(label="Copy Traffic", state="disabled")
-        edit_menu.add_command(label="Preferences…", state="disabled")
+        edit_menu.add_command(label="Preferences…", command=self.open_preferences)
         menu.add_cascade(label="Edit", menu=edit_menu)
         view_menu = tk.Menu(menu, tearoff=False)
         view_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
-        view_menu.add_command(label="Show in Tray", state="disabled")
+        view_menu.add_command(label="View Log Files…", command=self.view_log_files)
         menu.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu, tearoff=False)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", APP_NAME, parent=self.root))
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.configure(menu=menu)
+
+    def open_preferences(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Preferences")
+        outer = ttk.Frame(window, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Checkbutton(outer, text="Start minimized", variable=self.start_minimized_var).grid(row=0, column=0, sticky="w")
+        if is_windows():
+            button = ttk.Button(outer, command=self.toggle_windows_startup)
+            button.grid(row=1, column=0, sticky="w", pady=(8, 0))
+            button.configure(text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in")
+        else:
+            ttk.Label(outer, text="Start at sign-in is available on Windows only.").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(outer, text="Hide window to tray", command=self.root.withdraw).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(outer, text="Close", command=lambda: (self._save_settings(), window.destroy())).grid(row=3, column=0, sticky="e", pady=(12, 0))
+
+    def view_log_files(self) -> None:
+        """Show available session logs without exposing them for modification."""
+        configured = Path(self.log_file_var.get().strip() or settings_directory() / "prolab_translator.log")
+        directory = configured.expanduser().parent
+        window = tk.Toplevel(self.root)
+        window.title("Session Log Files")
+        window.geometry("820x520")
+        window.minsize(620, 360)
+        outer = ttk.Frame(window, padding=6)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+        files = sorted(directory.glob("*.log*"), key=lambda item: item.stat().st_mtime, reverse=True) if directory.exists() else []
+        names = [path.name for path in files]
+        listing = tk.Listbox(outer, exportselection=False, width=38)
+        listing.grid(row=0, column=0, sticky="ns")
+        for name in names:
+            listing.insert("end", name)
+        text = tk.Text(outer, wrap="none", state="disabled", font=("TkFixedFont", 9))
+        text.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        def show_selected(_event: object = None) -> None:
+            selected = listing.curselection()
+            if not selected:
+                return
+            try:
+                content = files[selected[0]].read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                content = f"Could not read log file: {exc}"
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            text.configure(state="disabled")
+
+        listing.bind("<<ListboxSelect>>", show_selected)
+        if files:
+            listing.selection_set(0)
+            show_selected()
+        else:
+            text.configure(state="normal")
+            text.insert("1.0", f"No session logs found in:\n{directory}")
+            text.configure(state="disabled")
 
     def _device_from_combo_text(self, value: str) -> str:
         value = value.strip()
