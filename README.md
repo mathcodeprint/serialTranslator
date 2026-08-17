@@ -30,14 +30,21 @@ Do **not** configure GasWorks and the translator to both open COM5.
 
 ### When com0com is needed
 
-Install com0com on Windows when GasWorks and the translator run on the same PC
-and GasWorks must communicate through a COM port: it supplies the virtual
-null-modem pair that lets each application open a separate endpoint. It is also
-needed for the Windows **Simulate Traffic** test bench, which needs two pairs.
+Use com0com on Windows when the GasWorks desktop program and this translator
+run on the same PC and need to talk to each other over serial: it supplies a
+virtual null-modem pair so each program opens a different endpoint. The same
+topology can be made with another compatible virtual-COM-pair product, or with
+two physical serial adapters joined by an appropriate null-modem cable.
+
+The Windows **Simulate Traffic** test bench needs two virtual pairs. The app
+does not create Windows virtual ports itself; create the pairs in com0com (or a
+compatible tool) before clicking **Simulate Traffic**.
 
 It is not needed on Linux for the built-in simulation (the application creates
-temporary PTYs with `socat`), and it is not needed for a physical ProLab port.
-The ProLab side should use the actual USB/RS-232 COM port assigned by Windows.
+temporary PTYs with `socat`). It is also not needed merely because the ProLab
+is physical: the translator's Destination side should use the actual USB/RS-232
+COM port assigned by Windows. You still need a virtual pair on the Source side
+when connecting the local GasWorks program to this translator.
 
 ### Install and configure com0com
 
@@ -59,6 +66,34 @@ fake ProLab client; select `COM6` and `COM7` respectively in the translator.
 The com0com project documents that its installer initially provides the internal
 `CNCA0`/`CNCB0` pair and that additional pairs can be created using its setup
 tools. [com0com documentation](https://github.com/tanvir-ahmed-m4/com0com)
+
+### Create pairs with the com0com command-line tool
+
+Open **Setup Command Prompt** from the com0com Start-menu group. Run it as an
+administrator if com0com requires elevation on that computer. Before creating a
+pair, choose unused COM numbers that do not overlap with physical instruments.
+
+For a GasWorks-to-translator pair, create `COM5` ↔ `COM6`:
+
+```text
+install 0 PortName=COM5 PortName=COM6
+```
+
+Then enter `list` to confirm both endpoints. Configure GasWorks to use `COM5`
+and configure this translator's **Source port** as `COM6`.
+
+For the Windows fake test bench, create a second pair as well:
+
+```text
+install 0 PortName=COM7 PortName=COM8
+list
+```
+
+Use `COM5` in the fake GasWorks client, `COM6` as the translator Source port,
+`COM7` as the translator Destination port, and `COM8` in the fake ProLab
+client. If your com0com version does not accept `PortName=COM5` directly, use
+its Setup GUI to rename the generated `CNCA*`/`CNCB*` endpoints to those unused
+COM numbers.
 
 ## Install
 
