@@ -1,0 +1,45 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the version tag
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $env:Path += ";C:\Program Files (x86)\Inno Setup 6"
+          cmd /c scripts\build-windows-installer.bat
+
+      - name: Create release and upload installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $asset = "dist-installer\Serial-Protocol-Translator-Setup.exe"
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset --title "Serial Protocol Translator $tag" --generate-notes
+          }
