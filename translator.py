@@ -1111,7 +1111,7 @@ class ProLabTranslatorGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("860x600")
+        self.root.geometry("900x640")
         self.root.minsize(720, 500)
 
         self.event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -1137,6 +1137,7 @@ class ProLabTranslatorGUI:
         self.template_var = tk.StringVar(value=str(saved.get("template", "Generic bidirectional")))
         self.profile_var = tk.StringVar()
         self.pl_port_var = tk.StringVar(value=str(saved.get("pl_port", "")))
+        self.connection_summary_var = tk.StringVar(value="Configure the bridge before starting a session")
         self.gw_baud_var = tk.StringVar(value=str(saved.get("gw_baud", "9600")))
         self.pl_baud_var = tk.StringVar(value=str(saved.get("pl_baud", "9600")))
         # Fall back to the pre-per-port settings so existing installations keep
@@ -1164,6 +1165,14 @@ class ProLabTranslatorGUI:
             value=str(saved.get("log_file") or default_log_file)
         )
         self.status_var = tk.StringVar(value="Stopped")
+        self.activity_filter_var = tk.StringVar(value="")
+        self.pause_follow_var = tk.BooleanVar(value=False)
+        self.auto_scroll_var = tk.BooleanVar(value=bool(saved.get("auto_scroll", True)))
+        self.activity_line_limit_var = tk.StringVar(value=str(saved.get("activity_line_limit", "2000")))
+        self.confirm_stop_var = tk.BooleanVar(value=bool(saved.get("confirm_stop", True)))
+        self.activity_font_size_var = tk.StringVar(value=str(saved.get("activity_font_size", "9")))
+        self.gw_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
+        self.pl_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -1181,14 +1190,13 @@ class ProLabTranslatorGUI:
 
         topology = ttk.Label(
             outer,
-            text=(
-                "Bidirectional serial bridge. Choose a template or save a reusable profile."
-            ),
+            textvariable=self.connection_summary_var,
         )
         topology.grid(row=1, column=0, sticky="w", pady=(1, 6))
 
-        ports_frame = ttk.LabelFrame(outer, text="Serial ports", padding=6)
+        ports_frame = ttk.LabelFrame(outer, text="Session setup: serial ports", padding=6)
         ports_frame.grid(row=2, column=0, sticky="ew")
+        self.ports_frame = ports_frame
         ports_frame.columnconfigure(1, weight=1)
         ports_frame.columnconfigure(3, weight=1)
 
@@ -1237,8 +1245,9 @@ class ProLabTranslatorGUI:
         )
         self.refresh_button.grid(row=0, column=4, rowspan=2, padx=(12, 0), sticky="ns")
 
-        settings_frame = ttk.LabelFrame(outer, text="Serial / translator settings", padding=6)
+        settings_frame = ttk.LabelFrame(outer, text="Session setup: serial / translator settings", padding=6)
         settings_frame.grid(row=3, column=0, sticky="ew", pady=(6, 6))
+        self.settings_frame = settings_frame
 
         settings_frame.columnconfigure(1, weight=1)
         settings_frame.columnconfigure(2, weight=1)
@@ -1299,7 +1308,18 @@ class ProLabTranslatorGUI:
         traffic_frame = ttk.LabelFrame(outer, text="Live traffic", padding=6)
         traffic_frame.grid(row=4, column=0, sticky="nsew")
         traffic_frame.columnconfigure(0, weight=1)
-        traffic_frame.rowconfigure(0, weight=1)
+        traffic_frame.rowconfigure(1, weight=1)
+
+        activity_tools = ttk.Frame(traffic_frame)
+        activity_tools.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        activity_tools.columnconfigure(1, weight=1)
+        ttk.Label(activity_tools, text="Filter").grid(row=0, column=0, padx=(0, 4))
+        self.activity_filter_entry = ttk.Entry(activity_tools, textvariable=self.activity_filter_var)
+        self.activity_filter_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(activity_tools, text="Copy", command=self.copy_traffic).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(activity_tools, text="Clear", command=self.clear_traffic).grid(row=0, column=3, padx=(4, 0))
+        self.pause_follow_check = ttk.Checkbutton(activity_tools, text="Pause follow", variable=self.pause_follow_var)
+        self.pause_follow_check.grid(row=0, column=4, padx=(8, 0))
 
         self.traffic_text = tk.Text(
             traffic_frame,
@@ -1308,12 +1328,12 @@ class ProLabTranslatorGUI:
             height=12,
             state="disabled",
         )
-        self.traffic_text.grid(row=0, column=0, sticky="nsew")
+        self.traffic_text.grid(row=1, column=0, sticky="nsew")
 
         yscroll = ttk.Scrollbar(traffic_frame, orient="vertical", command=self.traffic_text.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
+        yscroll.grid(row=1, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(traffic_frame, orient="horizontal", command=self.traffic_text.xview)
-        xscroll.grid(row=1, column=0, sticky="ew")
+        xscroll.grid(row=2, column=0, sticky="ew")
         self.traffic_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         controls = ttk.Frame(outer)
@@ -1326,29 +1346,25 @@ class ProLabTranslatorGUI:
         self.stop_button = ttk.Button(controls, text="Stop Bridge", command=self.stop_bridge)
         self.stop_button.grid(row=0, column=1, padx=(0, 6))
 
+        self.setup_button = ttk.Button(controls, text="Session Setup", command=self.toggle_session_setup)
+        self.setup_button.grid(row=0, column=2)
+
         self.clear_button = ttk.Button(controls, text="Clear Traffic", command=self.clear_traffic)
-        self.clear_button.grid(row=0, column=2)
+        self.clear_button.grid(row=0, column=3, padx=(6, 0))
 
         self.simulate_button = ttk.Button(
             controls, text="Simulate Traffic", command=self.simulate_traffic
         )
-        self.simulate_button.grid(row=0, column=3, padx=(6, 0))
+        self.simulate_button.grid(row=0, column=4, padx=(6, 0))
 
         self.console_button = ttk.Button(controls, text="Serial Console", command=self.open_serial_console)
-        self.console_button.grid(row=0, column=4, padx=(6, 0))
+        self.console_button.grid(row=0, column=5, padx=(6, 0))
 
-        self.startup_button = ttk.Button(controls, command=self.toggle_windows_startup)
-        self.startup_button.grid(row=0, column=5, padx=(6, 0))
-        self._refresh_startup_button()
-
-        self.minimized_check = ttk.Checkbutton(controls, text="Start minimized", variable=self.start_minimized_var)
-        self.minimized_check.grid(row=0, column=6, padx=(6, 0))
-
-        ttk.Label(controls, text="Status:").grid(row=0, column=7, padx=(12, 4))
+        ttk.Label(controls, text="Status:").grid(row=0, column=6, padx=(12, 4))
         self.status_label = ttk.Label(
             controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold")
         )
-        self.status_label.grid(row=0, column=8, sticky="e")
+        self.status_label.grid(row=0, column=7, sticky="e")
 
         self.config_widgets = [
             self.gw_port_combo,
@@ -1366,11 +1382,12 @@ class ProLabTranslatorGUI:
             self.gw_dsrdtr_check, self.pl_dsrdtr_check,
             self.auto_reconnect_check,
             self.reconnect_delay_entry,
-            self.minimized_check,
             self.log_entry,
             self.browse_button,
             self.refresh_button,
         ]
+        self.session_setup_visible = True
+        self.toggle_session_setup()
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
@@ -1406,20 +1423,80 @@ class ProLabTranslatorGUI:
         """Open a separate, raw serial terminal for an available device."""
         SerialConsole(self.root)
 
+    def toggle_session_setup(self) -> None:
+        """Keep the dashboard activity-first while retaining quick setup access."""
+        if self.session_setup_visible:
+            self.ports_frame.grid_remove()
+            self.settings_frame.grid_remove()
+            self.session_setup_visible = False
+            self.setup_button.configure(text="Session Setup")
+        else:
+            self.ports_frame.grid()
+            self.settings_frame.grid()
+            self.session_setup_visible = True
+            self.setup_button.configure(text="Hide Setup")
+
     def open_preferences(self) -> None:
         window = tk.Toplevel(self.root)
         window.title("Preferences")
-        outer = ttk.Frame(window, padding=10)
+        window.geometry("620x460")
+        window.minsize(540, 380)
+        outer = ttk.Frame(window, padding=8)
         outer.pack(fill="both", expand=True)
-        ttk.Checkbutton(outer, text="Start minimized", variable=self.start_minimized_var).grid(row=0, column=0, sticky="w")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(outer)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        behavior = ttk.Frame(notebook, padding=10)
+        activity = ttk.Frame(notebook, padding=10)
+        serial_defaults = ttk.Frame(notebook, padding=10)
+        diagnostics = ttk.Frame(notebook, padding=10)
+        notebook.add(behavior, text="Behavior")
+        notebook.add(serial_defaults, text="Serial defaults")
+        notebook.add(activity, text="Activity")
+        notebook.add(diagnostics, text="Safety & diagnostics")
+
+        ttk.Checkbutton(behavior, text="Start minimized", variable=self.start_minimized_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(behavior, text="Auto reconnect by default", variable=self.auto_reconnect_var).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(behavior, text="Retry delay (seconds)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(behavior, textvariable=self.reconnect_delay_var, width=10).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
         if is_windows():
-            button = ttk.Button(outer, command=self.toggle_windows_startup)
-            button.grid(row=1, column=0, sticky="w", pady=(8, 0))
-            button.configure(text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in")
+            self.preference_startup_button = ttk.Button(behavior, command=self.toggle_windows_startup)
+            self.preference_startup_button.grid(row=3, column=0, sticky="w", pady=(12, 0))
+            self._refresh_startup_button()
         else:
-            ttk.Label(outer, text="Start at sign-in is available on Windows only.").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(outer, text="Hide window to tray", command=self.root.withdraw).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(outer, text="Close", command=lambda: (self._save_settings(), window.destroy())).grid(row=3, column=0, sticky="e", pady=(12, 0))
+            ttk.Label(behavior, text="Start at sign-in is available on Windows only.").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(behavior, text="Hide window to tray", command=self.root.withdraw).grid(row=4, column=0, sticky="w", pady=(12, 0))
+
+        ttk.Label(serial_defaults, text="Per-session port and serial settings are available from Session Setup.").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(serial_defaults, text="Default bridge template").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Combobox(serial_defaults, textvariable=self.template_var, values=tuple(TEMPLATES), state="readonly", width=24).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
+        ttk.Label(serial_defaults, text="Read timeout (ms)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.read_timeout_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(serial_defaults, text="Write timeout (s)").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.write_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(serial_defaults, text="CR wait (ms)").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.cr_wait_var, width=10).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Checkbutton(activity, text="Follow new traffic automatically", variable=self.auto_scroll_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(activity, text="Activity font size").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        font_size = ttk.Spinbox(activity, from_=7, to=18, textvariable=self.activity_font_size_var, width=6, command=self.apply_activity_preferences)
+        font_size.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(activity, text="Maximum visible lines").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(activity, textvariable=self.activity_line_limit_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(activity, text="Use the dashboard Filter field to show matching activity as it arrives.").grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Checkbutton(diagnostics, text="Confirm before stopping an active bridge", variable=self.confirm_stop_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(diagnostics, text="Diagnostic logs rotate at 5 MiB and retain three backups.").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(diagnostics, text="Log file").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(diagnostics, textvariable=self.log_file_var, width=52).grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        ttk.Button(diagnostics, text="Choose…", command=self.choose_log_file).grid(row=3, column=1, padx=(6, 0), pady=(3, 0))
+
+        bottom = ttk.Frame(outer)
+        bottom.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(bottom, text="Apply", command=lambda: (self.apply_activity_preferences(), self._save_settings())).pack(side="right")
+        ttk.Button(bottom, text="Close", command=lambda: (self.apply_activity_preferences(), self._save_settings(), window.destroy())).pack(side="right", padx=(0, 6))
 
     def view_log_files(self) -> None:
         """Show available session logs without exposing them for modification."""
@@ -1500,7 +1577,13 @@ class ProLabTranslatorGUI:
 
         self.gw_port_var.set(choose_display(current_gw or "COM6"))
         self.pl_port_var.set(choose_display(current_pl or "COM4"))
+        self._refresh_connection_summary()
         self._append_log(f"Detected {len(displays)} serial port(s).")
+
+    def _refresh_connection_summary(self) -> None:
+        gw = self._device_from_combo_text(self.gw_port_var.get()) or "Source port not selected"
+        pl = self._device_from_combo_text(self.pl_port_var.get()) or "Destination port not selected"
+        self.connection_summary_var.set(f"Session route: {gw}  →  {pl}")
 
     def _save_settings(self) -> None:
         """Persist UI choices without making serial operation depend on disk I/O."""
@@ -1531,8 +1614,26 @@ class ProLabTranslatorGUI:
                 "reconnect_delay_s": self.reconnect_delay_var.get(),
                 "start_minimized": self.start_minimized_var.get(),
                 "log_file": self.log_file_var.get(),
+                "auto_scroll": self.auto_scroll_var.get(),
+                "activity_line_limit": self.activity_line_limit_var.get(),
+                "activity_font_size": self.activity_font_size_var.get(),
+                "confirm_stop": self.confirm_stop_var.get(),
             },
         )
+
+    def apply_activity_preferences(self) -> None:
+        """Apply display-only settings without interrupting the bridge."""
+        try:
+            size = int(self.activity_font_size_var.get())
+            line_limit = int(self.activity_line_limit_var.get())
+            if not 7 <= size <= 18:
+                raise ValueError("Activity font size must be between 7 and 18")
+            if line_limit < 100:
+                raise ValueError("Maximum visible lines must be at least 100")
+        except ValueError as exc:
+            messagebox.showerror("Activity preferences", str(exc), parent=self.root)
+            return
+        self.traffic_text.configure(font=("Consolas", size))
 
     def save_profile(self) -> None:
         name = simpledialog.askstring("Save profile", "Profile name:", parent=self.root)
@@ -1647,15 +1748,21 @@ class ProLabTranslatorGUI:
             messagebox.showerror("Could not start bridge", str(exc), parent=self.root)
 
     def stop_bridge(self) -> None:
+        if self.confirm_stop_var.get() and self.controller.running:
+            if not messagebox.askyesno("Stop bridge", "Stop the active serial bridge?", parent=self.root):
+                return
         self.controller.stop()
 
     def _refresh_startup_button(self) -> None:
+        button = getattr(self, "preference_startup_button", None)
+        if button is None or not button.winfo_exists():
+            return
         if is_windows():
-            self.startup_button.configure(
+            button.configure(
                 text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in"
             )
         else:
-            self.startup_button.configure(text="Start at sign-in (Windows)", state="disabled")
+            button.configure(text="Start at sign-in (Windows)", state="disabled")
 
     def toggle_windows_startup(self) -> None:
         try:
@@ -1727,15 +1834,30 @@ class ProLabTranslatorGUI:
         self.root.after(100, self.start_bridge)
 
     def _append_log(self, text: str) -> None:
+        needle = self.activity_filter_var.get().strip().casefold()
+        if needle and needle not in text.casefold():
+            return
         self.traffic_text.configure(state="normal")
         self.traffic_text.insert("end", text.rstrip("\n") + "\n")
-        self.traffic_text.see("end")
+        try:
+            line_limit = max(100, int(self.activity_line_limit_var.get()))
+        except ValueError:
+            line_limit = 2000
+        line_count = int(self.traffic_text.index("end-1c").split(".")[0])
+        if line_count > line_limit:
+            self.traffic_text.delete("1.0", f"{line_count - line_limit + 1}.0")
+        if self.auto_scroll_var.get() and not self.pause_follow_var.get():
+            self.traffic_text.see("end")
         self.traffic_text.configure(state="disabled")
 
     def clear_traffic(self) -> None:
         self.traffic_text.configure(state="normal")
         self.traffic_text.delete("1.0", "end")
         self.traffic_text.configure(state="disabled")
+
+    def copy_traffic(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.traffic_text.get("1.0", "end-1c"))
 
     def _drain_events(self) -> None:
         try:

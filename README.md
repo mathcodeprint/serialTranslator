@@ -183,6 +183,14 @@ The GUI keeps serial work on background threads and shows the same traffic log
 live. GasWorks and ProLab each have their own baud rate, data bits, parity,
 stop bits, and XON/XOFF, RTS/CTS, and DSR/DTR flow-control settings.
 
+The main window opens as a session dashboard: use **Session Setup** to reveal
+the port and per-side serial settings, and keep the rest of the window focused
+on live activity. The activity view can filter new entries, copy or clear the
+visible history, pause automatic following, and retain a bounded number of
+lines. **Edit → Preferences** contains persistent startup/reconnect behavior,
+serial timing defaults, activity display options, logging, and stop-confirmation
+controls.
+
 The GUI retries a dropped or unavailable serial connection every three seconds
 by default. The status changes to **Reconnecting** while it retries; use
 **Stop Bridge** to stop retrying, or turn off **Auto reconnect** for a
