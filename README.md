@@ -188,6 +188,13 @@ by default. The status changes to **Reconnecting** while it retries; use
 **Stop Bridge** to stop retrying, or turn off **Auto reconnect** for a
 single-attempt session.
 
+Use **Serial Console** to open a compact, independent serial terminal for an
+available device. It has separate port, baud, framing, and flow-control
+settings, displays transmitted and received bytes as hex and ASCII, and can
+send Latin-1 text or exact hexadecimal bytes. A serial port can be opened by
+only one program at a time, so do not connect the console to a port currently
+used by the bridge, GasWorks, or ProLab.
+
 On Windows, **Start bridge at sign-in** adds a per-user Startup entry. At the
 next sign-in it opens the normal application and starts the bridge with the
 saved settings; automatic reconnect keeps retrying until the configured COM

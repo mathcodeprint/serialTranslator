@@ -1,6 +1,6 @@
 ; Build after scripts\build-windows.bat using Inno Setup 6.
 #define AppName "Serial Protocol Translator"
-#define AppVersion "1.0.0"
+#define AppVersion "0.2.0"
 #define AppPublisher "Serial Protocol Translator"
 #define AppExeName "GasWorks-ProLab-Serial-Translator.exe"
 

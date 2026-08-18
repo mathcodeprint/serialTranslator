@@ -1334,18 +1334,21 @@ class ProLabTranslatorGUI:
         )
         self.simulate_button.grid(row=0, column=3, padx=(6, 0))
 
+        self.console_button = ttk.Button(controls, text="Serial Console", command=self.open_serial_console)
+        self.console_button.grid(row=0, column=4, padx=(6, 0))
+
         self.startup_button = ttk.Button(controls, command=self.toggle_windows_startup)
-        self.startup_button.grid(row=0, column=4, padx=(6, 0))
+        self.startup_button.grid(row=0, column=5, padx=(6, 0))
         self._refresh_startup_button()
 
         self.minimized_check = ttk.Checkbutton(controls, text="Start minimized", variable=self.start_minimized_var)
-        self.minimized_check.grid(row=0, column=5, padx=(6, 0))
+        self.minimized_check.grid(row=0, column=6, padx=(6, 0))
 
-        ttk.Label(controls, text="Status:").grid(row=0, column=6, padx=(12, 4))
+        ttk.Label(controls, text="Status:").grid(row=0, column=7, padx=(12, 4))
         self.status_label = ttk.Label(
             controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold")
         )
-        self.status_label.grid(row=0, column=7, sticky="e")
+        self.status_label.grid(row=0, column=8, sticky="e")
 
         self.config_widgets = [
             self.gw_port_combo,
@@ -1391,12 +1394,17 @@ class ProLabTranslatorGUI:
         menu.add_cascade(label="Edit", menu=edit_menu)
         view_menu = tk.Menu(menu, tearoff=False)
         view_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
+        view_menu.add_command(label="Serial Console…", command=self.open_serial_console)
         view_menu.add_command(label="View Log Files…", command=self.view_log_files)
         menu.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu, tearoff=False)
         help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", APP_NAME, parent=self.root))
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.configure(menu=menu)
+
+    def open_serial_console(self) -> None:
+        """Open a separate, raw serial terminal for an available device."""
+        SerialConsole(self.root)
 
     def open_preferences(self) -> None:
         window = tk.Toplevel(self.root)
@@ -1849,6 +1857,244 @@ class LinuxVirtualTestBench:
             path = Path(alias)
             if path.is_symlink():
                 path.unlink()
+
+
+class SerialConsoleEndpoint:
+    """Background serial reader/writer used by the general-purpose console."""
+
+    def __init__(self, events: queue.Queue[tuple[str, object]]) -> None:
+        self.events = events
+        self.stop_event = threading.Event()
+        self.tx_queue: queue.Queue[bytes] = queue.Queue()
+        self.thread: Optional[threading.Thread] = None
+
+    @property
+    def running(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
+
+    def start(self, settings: PortSettings) -> None:
+        if self.running:
+            raise RuntimeError("Already connected")
+        self.stop_event = threading.Event()
+        self.tx_queue = queue.Queue()
+        self.thread = threading.Thread(target=self._worker, args=(settings,), daemon=True)
+        self.thread.start()
+
+    def send(self, data: bytes) -> None:
+        if not self.running:
+            raise RuntimeError("Not connected")
+        if data:
+            self.tx_queue.put(data)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _worker(self, settings: PortSettings) -> None:
+        ser: Optional[serial.Serial] = None
+        try:
+            ser = open_serial(settings)
+            self.events.put(("state", "connected|Connected"))
+            while not self.stop_event.is_set():
+                try:
+                    while True:
+                        data = self.tx_queue.get_nowait()
+                        write_all(ser, data)
+                        self.events.put(("tx", data))
+                except queue.Empty:
+                    pass
+                data = read_available(ser)
+                if data:
+                    self.events.put(("rx", data))
+        except (SerialException, OSError, ValueError) as exc:
+            if not self.stop_event.is_set():
+                self.events.put(("error", str(exc)))
+        finally:
+            if ser is not None and ser.is_open:
+                try:
+                    ser.close()
+                except OSError:
+                    pass
+            self.events.put(("state", "disconnected|Disconnected"))
+
+
+class SerialConsole:
+    """Compact serial terminal that displays and sends unmodified byte streams."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        self.window = tk.Toplevel(parent)
+        self.window.title("Serial Console")
+        self.window.geometry("720x500")
+        self.window.minsize(580, 400)
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.endpoint = SerialConsoleEndpoint(self.events)
+        self.saved_settings = load_settings("serial_console")
+        self.port_map: dict[str, str] = {}
+        self.port_var = tk.StringVar(value=str(self.saved_settings.get("port", "")))
+        self.baud_var = tk.StringVar(value=str(self.saved_settings.get("baud", "9600")))
+        self.bytesize_var = tk.StringVar(value=str(self.saved_settings.get("bytesize", "8")))
+        self.parity_var = tk.StringVar(value=str(self.saved_settings.get("parity", "N")))
+        self.stopbits_var = tk.StringVar(value=str(self.saved_settings.get("stopbits", "1")))
+        self.xonxoff_var = tk.BooleanVar(value=bool(self.saved_settings.get("xonxoff", False)))
+        self.rtscts_var = tk.BooleanVar(value=bool(self.saved_settings.get("rtscts", False)))
+        self.dsrdtr_var = tk.BooleanVar(value=bool(self.saved_settings.get("dsrdtr", False)))
+        self.send_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Disconnected")
+        self._build_ui()
+        self.refresh_ports()
+        self._set_connected(False)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window.after(50, self._drain_events)
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.window, padding=6)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(outer, text="Serial Console", font=("TkDefaultFont", 13, "bold")).grid(row=0, column=0, sticky="w")
+        settings = ttk.LabelFrame(outer, text="Connection", padding=6)
+        settings.grid(row=1, column=0, sticky="ew", pady=(4, 5))
+        settings.columnconfigure(1, weight=1)
+        ttk.Label(settings, text="Port").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(settings, textvariable=self.port_var, width=30)
+        self.port_combo.grid(row=0, column=1, sticky="ew", padx=(4, 6))
+        self.refresh_button = ttk.Button(settings, text="Refresh", command=self.refresh_ports)
+        self.refresh_button.grid(row=0, column=2, padx=(0, 10))
+        ttk.Label(settings, text="Baud").grid(row=0, column=3, sticky="w")
+        self.baud_combo = ttk.Combobox(settings, textvariable=self.baud_var, values=COMMON_BAUD_RATES, width=8)
+        self.baud_combo.grid(row=0, column=4, padx=(4, 8))
+        self.connect_button = ttk.Button(settings, text="Connect", command=self.toggle_connection)
+        self.connect_button.grid(row=0, column=5)
+
+        ttk.Label(settings, text="Data bits").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.bytesize_combo = ttk.Combobox(settings, textvariable=self.bytesize_var, values=("5", "6", "7", "8"), state="readonly", width=5)
+        self.bytesize_combo.grid(row=1, column=1, sticky="w", padx=(4, 0), pady=(5, 0))
+        ttk.Label(settings, text="Parity").grid(row=1, column=2, sticky="e", pady=(5, 0))
+        self.parity_combo = ttk.Combobox(settings, textvariable=self.parity_var, values=("N", "E", "O", "M", "S"), state="readonly", width=4)
+        self.parity_combo.grid(row=1, column=3, sticky="w", padx=(4, 8), pady=(5, 0))
+        ttk.Label(settings, text="Stop bits").grid(row=1, column=4, sticky="e", pady=(5, 0))
+        self.stopbits_combo = ttk.Combobox(settings, textvariable=self.stopbits_var, values=("1", "1.5", "2"), state="readonly", width=4)
+        self.stopbits_combo.grid(row=1, column=5, sticky="w", pady=(5, 0))
+        self.xonxoff_check = ttk.Checkbutton(settings, text="XON/XOFF", variable=self.xonxoff_var)
+        self.xonxoff_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        self.rtscts_check = ttk.Checkbutton(settings, text="RTS/CTS", variable=self.rtscts_var)
+        self.rtscts_check.grid(row=2, column=2, columnspan=2, sticky="w", pady=(5, 0))
+        self.dsrdtr_check = ttk.Checkbutton(settings, text="DSR/DTR", variable=self.dsrdtr_var)
+        self.dsrdtr_check.grid(row=2, column=4, columnspan=2, sticky="w", pady=(5, 0))
+
+        traffic = ttk.LabelFrame(outer, text="Traffic", padding=5)
+        traffic.grid(row=2, column=0, sticky="nsew")
+        traffic.columnconfigure(0, weight=1)
+        traffic.rowconfigure(1, weight=1)
+        ttk.Button(traffic, text="Clear", command=self.clear_traffic).grid(row=0, column=0, sticky="e")
+        self.traffic = tk.Text(traffic, wrap="none", font=("TkFixedFont", 9), state="disabled")
+        self.traffic.grid(row=1, column=0, sticky="nsew", pady=(3, 0))
+        scrollbar = ttk.Scrollbar(traffic, orient="vertical", command=self.traffic.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(3, 0))
+        self.traffic.configure(yscrollcommand=scrollbar.set)
+
+        send = ttk.LabelFrame(outer, text="Send", padding=5)
+        send.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        send.columnconfigure(0, weight=1)
+        self.send_entry = ttk.Entry(send, textvariable=self.send_var)
+        self.send_entry.grid(row=0, column=0, sticky="ew")
+        self.send_entry.bind("<Return>", lambda _event: self.send_text())
+        ttk.Button(send, text="Send text", command=self.send_text).grid(row=0, column=1, padx=(5, 0))
+        ttk.Button(send, text="Send hex", command=self.send_hex).grid(row=0, column=2, padx=(5, 0))
+        ttk.Label(outer, textvariable=self.status_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+    def refresh_ports(self) -> None:
+        current = self.port_map.get(self.port_var.get(), self.port_var.get().split(" — ", 1)[0].strip())
+        ports = discover_serial_ports((current,))
+        self.port_map = {port.display: port.device for port in ports}
+        self.port_combo["values"] = list(self.port_map)
+        display = next((label for label, device in self.port_map.items() if device == current), current)
+        self.port_var.set(display)
+
+    def _settings(self) -> PortSettings:
+        port = self.port_map.get(self.port_var.get(), self.port_var.get().split(" — ", 1)[0].strip())
+        if not port:
+            raise ValueError("Choose or enter a serial port")
+        stopbits = {"1": serial.STOPBITS_ONE, "1.5": serial.STOPBITS_ONE_POINT_FIVE, "2": serial.STOPBITS_TWO}[self.stopbits_var.get()]
+        return PortSettings(
+            port=port, baudrate=int(self.baud_var.get()), bytesize=int(self.bytesize_var.get()),
+            parity=self.parity_var.get(), stopbits=stopbits, timeout=0.02, write_timeout=2.0,
+            xonxoff=self.xonxoff_var.get(), rtscts=self.rtscts_var.get(), dsrdtr=self.dsrdtr_var.get(),
+        )
+
+    def toggle_connection(self) -> None:
+        if self.endpoint.running:
+            self.endpoint.stop()
+            return
+        try:
+            self.endpoint.start(self._settings())
+        except (ValueError, KeyError) as exc:
+            messagebox.showerror("Connection settings", str(exc), parent=self.window)
+
+    def _set_connected(self, connected: bool) -> None:
+        self.connect_button.configure(text="Disconnect" if connected else "Connect")
+        state = "disabled" if connected else "normal"
+        for widget in (self.port_combo, self.baud_combo, self.refresh_button, self.xonxoff_check, self.rtscts_check, self.dsrdtr_check):
+            widget.configure(state=state)
+        for widget in (self.bytesize_combo, self.parity_combo, self.stopbits_combo):
+            widget.configure(state="disabled" if connected else "readonly")
+
+    def send_text(self) -> None:
+        try:
+            self.endpoint.send(self.send_var.get().encode("latin-1"))
+        except (UnicodeEncodeError, RuntimeError) as exc:
+            messagebox.showerror("Send text", str(exc), parent=self.window)
+
+    def send_hex(self) -> None:
+        try:
+            data = bytes.fromhex(self.send_var.get())
+            if not data:
+                raise ValueError("Enter one or more hexadecimal bytes")
+            self.endpoint.send(data)
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showerror("Send hex", str(exc), parent=self.window)
+
+    def _append(self, direction: str, data: bytes) -> None:
+        self.traffic.configure(state="normal")
+        self.traffic.insert("end", f"{direction:<3} | HEX: {hex_view(data)} | ASCII: {ascii_view(data)}\n")
+        self.traffic.see("end")
+        self.traffic.configure(state="disabled")
+
+    def clear_traffic(self) -> None:
+        self.traffic.configure(state="normal")
+        self.traffic.delete("1.0", "end")
+        self.traffic.configure(state="disabled")
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, data = self.events.get_nowait()
+                if kind in ("tx", "rx"):
+                    self._append(kind.upper(), data)  # type: ignore[arg-type]
+                elif kind == "state":
+                    state, text = str(data).split("|", 1)
+                    self.status_var.set(text)
+                    self._set_connected(state == "connected")
+                elif kind == "error":
+                    self.status_var.set(f"Error: {data}")
+                    messagebox.showerror("Serial error", str(data), parent=self.window)
+        except queue.Empty:
+            pass
+        if self.window.winfo_exists():
+            self.window.after(50, self._drain_events)
+
+    def close(self) -> None:
+        try:
+            settings = self._settings()
+            save_settings("serial_console", {
+                "port": settings.port, "baud": self.baud_var.get(), "bytesize": self.bytesize_var.get(),
+                "parity": self.parity_var.get(), "stopbits": self.stopbits_var.get(),
+                "xonxoff": self.xonxoff_var.get(), "rtscts": self.rtscts_var.get(), "dsrdtr": self.dsrdtr_var.get(),
+            })
+        except (ValueError, KeyError):
+            pass
+        self.endpoint.stop()
+        self.window.destroy()
 
 
 class TestClientEndpoint:
