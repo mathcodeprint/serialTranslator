@@ -1,6 +1,6 @@
 # GasWorks ↔ ProLab Serial Translator
 
-Current version: **0.5.0**
+Current version: **0.5.1**
 
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 

@@ -60,7 +60,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $installer = "dist-installer/Serial-Protocol-Translator-Setup.exe"
-          gh release view "$env:RELEASE_TAG" *> $null
+          cmd /c "gh release view %RELEASE_TAG% >nul 2>nul"
           if ($LASTEXITCODE -eq 0) {
             gh release upload "$env:RELEASE_TAG" $installer --clobber
           } else {

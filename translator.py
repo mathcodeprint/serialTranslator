@@ -37,7 +37,7 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 GITHUB_REPOSITORY = "mathcodeprint/serialTranslator"
 WINDOWS_INSTALLER_NAME = "Serial-Protocol-Translator-Setup.exe"
 TRAFFIC_LOG_MODES = ("full", "metadata", "off")
