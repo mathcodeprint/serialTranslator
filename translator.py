@@ -37,7 +37,7 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 GITHUB_REPOSITORY = "mathcodeprint/serialTranslator"
 WINDOWS_INSTALLER_NAME = "Serial-Protocol-Translator-Setup.exe"
 TRAFFIC_LOG_MODES = ("full", "metadata", "off")
@@ -157,6 +157,23 @@ def source_repository_directory() -> Optional[Path]:
         return None
     directory = Path(__file__).resolve().parent
     return directory if (directory / ".git").exists() else None
+
+
+def runtime_dependency_check() -> int:
+    """Import every GUI runtime dependency; used to validate frozen Windows builds."""
+    try:
+        import tkinter  # noqa: F401
+        from tkinter import ttk as _ttk  # noqa: F401
+        import serial as _serial  # noqa: F401
+        import pystray as _pystray  # noqa: F401
+        from PIL import Image as _image, ImageDraw as _image_draw  # noqa: F401
+        if is_windows():
+            import pystray._win32  # noqa: F401
+    except Exception as exc:
+        print(f"Runtime dependency check failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"{APP_NAME} {APP_VERSION}: runtime dependency check passed")
+    return 0
 
 
 def _git_output(repository: Path, *arguments: str) -> str:
@@ -3094,6 +3111,8 @@ class ProLabTestClient(BaseTestClient):
 
 
 if __name__ == "__main__":
+    if "--runtime-check" in sys.argv[1:]:
+        raise SystemExit(runtime_dependency_check())
     if getattr(sys, "frozen", False) or "--gui" in sys.argv[1:]:
         start_test_bench = "--start-test-bench" in sys.argv[1:]
         autostart = "--autostart" in sys.argv[1:]

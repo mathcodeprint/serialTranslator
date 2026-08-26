@@ -132,8 +132,8 @@ class WindowsReleaseUpdateTests(unittest.TestCase):
 
     def test_windows_release_update_uses_matching_installer_asset(self) -> None:
         payload = {
-            "tag_name": "v0.5.0",
-            "name": "Version 0.5.0",
+            "tag_name": "v0.6.0",
+            "name": "Version 0.6.0",
             "assets": [{
                 "name": "Serial-Protocol-Translator-Setup.exe",
                 "browser_download_url": "https://example.invalid/installer.exe",
@@ -155,7 +155,7 @@ class WindowsReleaseUpdateTests(unittest.TestCase):
             update = check_for_windows_release_update()
         self.assertIsNotNone(update)
         assert update is not None
-        self.assertEqual(update.version, "0.5.0")
+        self.assertEqual(update.version, "0.6.0")
         self.assertEqual(update.download_url, "https://example.invalid/installer.exe")
         self.assertEqual(update.sha256, "a" * 64)
 

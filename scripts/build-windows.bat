@@ -22,6 +22,10 @@ if not errorlevel 1 (
     --collect-all serial ^
     --collect-all pystray ^
     --collect-all PIL ^
+    --hidden-import pystray._win32 ^
+    --hidden-import PIL.ImageTk ^
+    --hidden-import tkinter ^
+    --hidden-import tkinter.ttk ^
     translator.py
 ) else py -m PyInstaller --noconfirm --clean --windowed --onedir ^
   --name "GasWorks-ProLab-Serial-Translator" ^
@@ -29,6 +33,10 @@ if not errorlevel 1 (
   --collect-all serial ^
   --collect-all pystray ^
   --collect-all PIL ^
+  --hidden-import pystray._win32 ^
+  --hidden-import PIL.ImageTk ^
+  --hidden-import tkinter ^
+  --hidden-import tkinter.ttk ^
   translator.py
 if errorlevel 1 exit /b 1
 

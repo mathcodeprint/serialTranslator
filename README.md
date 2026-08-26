@@ -1,6 +1,6 @@
 # GasWorks ↔ ProLab Serial Translator
 
-Current version: **0.4.0**
+Current version: **0.5.0**
 
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
@@ -161,6 +161,17 @@ needs virtual COM-port pairs.
 For installed-app automatic updates, attach that exact installer filename to
 the corresponding GitHub Release and use a semantic release tag such as
 `v0.3.0`.
+
+### Automated Windows releases
+
+GitHub Actions builds the Windows executable and Inno Setup installer for pull
+requests, then uploads the installer as an artifact. Pushing a semantic tag
+such as `v0.4.0` also publishes (or updates) a GitHub Release with the exact
+installer asset required by the installed-app updater. You can rerun the
+workflow manually and enter an existing release tag to rebuild or replace its
+installer asset. Before uploading, the workflow runs the frozen executable's
+dependency self-check so a release cannot be published with missing GUI, tray,
+serial, or Pillow modules.
 
 To download the official Inno Setup installer and build without opening a web
 browser, run:
