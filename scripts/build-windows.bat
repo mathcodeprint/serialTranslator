@@ -18,12 +18,14 @@ py -3.7 -c "import sys" >nul 2>nul
 if not errorlevel 1 (
   py -3.7 -m PyInstaller --noconfirm --clean --windowed --onedir ^
     --name "GasWorks-ProLab-Serial-Translator" ^
+    --icon "assets\serial-protocol-translator.ico" ^
     --collect-all serial ^
     --collect-all pystray ^
     --collect-all PIL ^
     translator.py
 ) else py -m PyInstaller --noconfirm --clean --windowed --onedir ^
   --name "GasWorks-ProLab-Serial-Translator" ^
+  --icon "assets\serial-protocol-translator.ico" ^
   --collect-all serial ^
   --collect-all pystray ^
   --collect-all PIL ^

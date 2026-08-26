@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import queue
 import select
@@ -25,11 +26,13 @@ from translator import (
     ascii_view,
     build_parser,
     check_for_git_update,
+    check_for_windows_release_update,
     gw_to_pl_worker,
     main,
     open_serial,
     pl_to_gw_worker,
     session_log_path,
+    semver_key,
     simulated_traffic,
 )
 
@@ -117,6 +120,40 @@ class GitUpdateTests(unittest.TestCase):
         with mock.patch("translator._git_output", side_effect=("", "")) as git:
             apply_git_update(Path("/example/repository"))
         self.assertEqual(git.call_args_list[1].args[1:], ("pull", "--ff-only"))
+
+
+class WindowsReleaseUpdateTests(unittest.TestCase):
+    def test_semver_key_accepts_normal_release_tags(self) -> None:
+        self.assertEqual(semver_key("v1.2.3"), (1, 2, 3))
+        with self.assertRaises(ValueError):
+            semver_key("release-1.2.3")
+
+    def test_windows_release_update_uses_matching_installer_asset(self) -> None:
+        payload = {
+            "tag_name": "v0.4.0",
+            "name": "Version 0.4.0",
+            "assets": [{
+                "name": "Serial-Protocol-Translator-Setup.exe",
+                "browser_download_url": "https://example.invalid/installer.exe",
+            }],
+        }
+
+        class Response:
+            def read(self) -> bytes:
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                pass
+
+        with mock.patch("translator.urlopen", return_value=Response()):
+            update = check_for_windows_release_update()
+        self.assertIsNotNone(update)
+        assert update is not None
+        self.assertEqual(update.version, "0.4.0")
+        self.assertEqual(update.download_url, "https://example.invalid/installer.exe")
 
 
 class SimulationTests(unittest.TestCase):

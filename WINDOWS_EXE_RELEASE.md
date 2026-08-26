@@ -1,4 +1,4 @@
-# Serial Protocol Translator for Windows — v0.2.0
+# Serial Protocol Translator for Windows — v0.3.0
 
 This release provides the Windows installer for the GasWorks ↔ ProLab Serial
 Translator.
@@ -10,10 +10,12 @@ ProLab responses are sent back to GasWorks unchanged.
 
 ## Install
 
-1. Download `Serial-Protocol-Translator-Setup.exe` from this release.
+1. Download `Serial-Protocol-Translator-Setup.exe` from this release. Keep
+   this exact filename when uploading it as the release asset: installed apps
+   use it to identify a compatible automatic update.
 2. Run the installer and follow the prompts.
 3. Launch **Serial Protocol Translator** from the Start menu or optional
-   desktop shortcut.
+   desktop shortcut. Both shortcuts use the included application icon.
 4. Select the GasWorks and ProLab ports and their serial settings, then choose
    **Start Bridge**.
 

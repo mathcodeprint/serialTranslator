@@ -1,6 +1,6 @@
 # GasWorks ↔ ProLab Serial Translator
 
-Current version: **0.2.0**
+Current version: **0.3.0**
 
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
@@ -120,6 +120,9 @@ This produces a windowed, one-folder application at:
 dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe
 ```
 
+The build embeds the supplied application icon. The Windows installer uses it
+for the installer, Start Menu entry, and optional Desktop shortcut.
+
 The application stores its default GUI traffic log and saved settings in the
 current user's application-settings directory, not beside the installed `.exe`.
 Every bridge start creates a separate timestamped session log; each session log
@@ -134,8 +137,11 @@ update when newer commits are available. It refuses to overwrite local changes
 or update while the serial bridge is running; stop the bridge and commit or
 stash any changes first. After a successful update, it restarts the GUI.
 
-The installed Windows PyInstaller bundle is not a Git checkout, so this menu
-only reports that a newer installed release must be installed manually.
+The installed Windows PyInstaller bundle checks the project's GitHub Releases
+instead. When a newer release includes the standard installer asset
+`Serial-Protocol-Translator-Setup.exe`, the app offers to download it to the
+user settings directory, exits cleanly, installs it, and restarts. Source
+checkouts continue to use their Git upstream for updates.
 
 ### Build a Windows installer
 
@@ -150,6 +156,10 @@ It builds the application bundle and produces
 Start Menu shortcut and can optionally create a Desktop shortcut. It does not
 install com0com; install and configure that separately only when your topology
 needs virtual COM-port pairs.
+
+For installed-app automatic updates, attach that exact installer filename to
+the corresponding GitHub Release and use a semantic release tag such as
+`v0.3.0`.
 
 To download the official Inno Setup installer and build without opening a web
 browser, run:
@@ -243,8 +253,9 @@ scripts/install-linux-mint.sh
 ```
 
 It creates a virtual environment under `~/.local/share/serial-protocol-translator`
-and adds **Serial Protocol Translator** to the Mint application menu. If Mint's
-tray backend packages are missing, install them (administrator password needed):
+and adds **Serial Protocol Translator** to the Mint application menu and
+Desktop, both with the supplied application icon. If Mint's tray backend
+packages are missing, install them (administrator password needed):
 
 ```bash
 scripts/install-linux-mint.sh --system-deps

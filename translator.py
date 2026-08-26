@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -32,7 +36,9 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
+GITHUB_REPOSITORY = "mathcodeprint/serialTranslator"
+WINDOWS_INSTALLER_NAME = "Serial-Protocol-Translator-Setup.exe"
 TEMPLATES = {"Generic bidirectional": False, "GasWorks ↔ ProLab": True}
 WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
 
@@ -46,6 +52,89 @@ class GitUpdateStatus:
     dirty: bool
     current_commit: str
     available_commit: str
+
+
+@dataclass(frozen=True)
+class WindowsReleaseUpdate:
+    """A newer Windows installer published in the project's GitHub Releases."""
+
+    version: str
+    download_url: str
+    release_name: str
+
+
+def semver_key(version: str) -> tuple[int, int, int]:
+    """Return a strict SemVer release tuple, accepting an optional v prefix."""
+    match = re.fullmatch(r"[vV]?(\d+)\.(\d+)\.(\d+)", version.strip())
+    if match is None:
+        raise ValueError(f"Unsupported release version: {version!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def check_for_windows_release_update() -> Optional[WindowsReleaseUpdate]:
+    """Check GitHub Releases for a newer installer asset published by this project."""
+    request = Request(
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+    )
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned an invalid release response.")
+    version = str(payload.get("tag_name", "")).lstrip("vV")
+    if semver_key(version) <= semver_key(APP_VERSION):
+        return None
+    for asset in payload.get("assets", []):
+        if asset.get("name") == WINDOWS_INSTALLER_NAME and asset.get("browser_download_url"):
+            return WindowsReleaseUpdate(
+                version=version,
+                download_url=str(asset["browser_download_url"]),
+                release_name=str(payload.get("name") or f"Version {version}"),
+            )
+    raise RuntimeError(f"Release {version} does not include {WINDOWS_INSTALLER_NAME}.")
+
+
+def download_windows_installer(update: WindowsReleaseUpdate) -> Path:
+    """Download an installer to user settings, never the installed app folder."""
+    updates_dir = settings_directory() / "updates"
+    updates_dir.mkdir(parents=True, exist_ok=True)
+    destination = updates_dir / f"Serial-Protocol-Translator-Setup-{update.version}.exe"
+    descriptor, temporary_path = tempfile.mkstemp(prefix="download-", suffix=".tmp", dir=updates_dir)
+    os.close(descriptor)
+    temporary = Path(temporary_path)
+    try:
+        request = Request(update.download_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        with urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+        if temporary.stat().st_size < 1024 or temporary.read_bytes()[:2] != b"MZ":
+            raise RuntimeError("The downloaded update is not a valid Windows installer.")
+        temporary.replace(destination)
+        return destination
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def launch_windows_installer_after_exit(installer: Path) -> None:
+    """Run the downloaded installer after the frozen GUI has released its files."""
+    if not (is_windows() and getattr(sys, "frozen", False)):
+        raise RuntimeError("Windows installer updates are available only from the installed Windows application.")
+    descriptor, command_path = tempfile.mkstemp(prefix="install-update-", suffix=".cmd", dir=installer.parent)
+    os.close(descriptor)
+    command_file = Path(command_path)
+    executable = Path(sys.executable)
+    command_file.write_text(
+        "@echo off\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+        f'start "" /wait "{installer}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /CLOSEAPPLICATIONS\r\n'
+        "if errorlevel 1 goto cleanup\r\n"
+        f'start "" "{executable}"\r\n'
+        ":cleanup\r\n"
+        "del \"%~f0\"\r\n",
+        encoding="utf-8",
+    )
+    subprocess.Popen(["cmd.exe", "/c", str(command_file)], close_fds=True)
 
 
 def source_repository_directory() -> Optional[Path]:
@@ -1620,6 +1709,9 @@ class ProLabTranslatorGUI:
             return
         repository = source_repository_directory()
         if repository is None:
+            if is_windows() and getattr(sys, "frozen", False):
+                self._check_windows_release_updates()
+                return
             messagebox.showinfo(
                 "Check for Updates",
                 "This installed application is not a Git source checkout. "
@@ -1641,6 +1733,75 @@ class ProLabTranslatorGUI:
 
         threading.Thread(target=worker, name="check-for-updates", daemon=True).start()
 
+    def _check_windows_release_updates(self) -> None:
+        """Check GitHub Releases for a newer installer without blocking Tkinter."""
+        self._update_check_in_progress = True
+        self.status_var.set("Checking GitHub Releases for updates...")
+
+        def worker() -> None:
+            try:
+                update = check_for_windows_release_update()
+            except (OSError, URLError, ValueError, RuntimeError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_check_error(error))
+            else:
+                self.root.after(0, lambda: self._finish_windows_release_check(update))
+
+        threading.Thread(target=worker, name="check-windows-release-updates", daemon=True).start()
+
+    def _finish_windows_release_check(self, update: Optional[WindowsReleaseUpdate]) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last checked: {datetime.now().strftime('%H:%M:%S')}")
+        if update is None:
+            self.status_var.set("Up to date")
+            messagebox.showinfo(
+                "Check for Updates",
+                f"You already have the latest version ({APP_VERSION}).",
+                parent=self.root,
+            )
+            return
+        if self.controller.running:
+            self.status_var.set("Update available")
+            messagebox.showinfo(
+                "Update Available",
+                f"Version {update.version} is available. Stop the serial bridge, then check again to update safely.",
+                parent=self.root,
+            )
+            return
+        if messagebox.askyesno(
+            "Update Available",
+            f"{update.release_name} (version {update.version}) is available.\n\n"
+            "Download, install, and restart now?",
+            parent=self.root,
+        ):
+            self._download_windows_update(update)
+        else:
+            self.status_var.set("Update available")
+
+    def _download_windows_update(self, update: WindowsReleaseUpdate) -> None:
+        self._update_check_in_progress = True
+        self.status_var.set(f"Downloading version {update.version}...")
+
+        def worker() -> None:
+            try:
+                installer = download_windows_installer(update)
+            except (OSError, URLError, RuntimeError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_error(error))
+            else:
+                self.root.after(0, lambda: self._install_windows_update(installer, update.version))
+
+        threading.Thread(target=worker, name="download-windows-update", daemon=True).start()
+
+    def _install_windows_update(self, installer: Path, version: str) -> None:
+        try:
+            launch_windows_installer_after_exit(installer)
+        except (OSError, RuntimeError) as exc:
+            self._finish_update_error(exc)
+            return
+        self._update_check_in_progress = False
+        self.status_var.set(f"Installing version {version}...")
+        self._save_settings()
+        self.on_close()
+
     def _finish_update_check_error(self, error: Exception) -> None:
         self._update_check_in_progress = False
         self.last_update_check_var.set(f"Last check failed: {datetime.now().strftime('%H:%M:%S')}")
@@ -1655,7 +1816,7 @@ class ProLabTranslatorGUI:
             extra = f"\n\nThis checkout also has {result.ahead} local commit(s) not on GitHub." if result.ahead else ""
             messagebox.showinfo(
                 "Check for Updates",
-                f"You already have the latest version ({result.current_commit}).{extra}",
+                f"You already have the latest version ({APP_VERSION}; commit {result.current_commit}).{extra}",
                 parent=self.root,
             )
             return
