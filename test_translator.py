@@ -21,8 +21,10 @@ from translator import (
     SerialBridgeController,
     SerialException,
     TrafficLogger,
+    apply_git_update,
     ascii_view,
     build_parser,
+    check_for_git_update,
     gw_to_pl_worker,
     main,
     open_serial,
@@ -90,6 +92,31 @@ class CliValidationTests(unittest.TestCase):
 class DisplayTests(unittest.TestCase):
     def test_ascii_view_keeps_control_bytes_visible(self) -> None:
         self.assertEqual(ascii_view(b"A\r\n\t\x00"), r"A\r\n\t.")
+
+
+class GitUpdateTests(unittest.TestCase):
+    def test_check_for_git_update_reports_remote_commits_and_dirty_worktree(self) -> None:
+        outputs = iter(("", "abc1234", "def5678 New release", "2\t3", " M translator.py"))
+        with mock.patch("translator._git_output", side_effect=lambda *_args: next(outputs)) as git:
+            result = check_for_git_update(Path("/example/repository"))
+
+        self.assertEqual(result.current_commit, "abc1234")
+        self.assertEqual(result.available_commit, "def5678 New release")
+        self.assertEqual(result.ahead, 2)
+        self.assertEqual(result.behind, 3)
+        self.assertTrue(result.dirty)
+        self.assertEqual(git.call_args_list[0].args[1:], ("fetch", "origin", "--prune"))
+
+    def test_apply_git_update_refuses_dirty_checkout(self) -> None:
+        with mock.patch("translator._git_output", return_value=" M translator.py") as git:
+            with self.assertRaisesRegex(RuntimeError, "Local changes"):
+                apply_git_update(Path("/example/repository"))
+        self.assertEqual(git.call_count, 1)
+
+    def test_apply_git_update_uses_fast_forward_only(self) -> None:
+        with mock.patch("translator._git_output", side_effect=("", "")) as git:
+            apply_git_update(Path("/example/repository"))
+        self.assertEqual(git.call_args_list[1].args[1:], ("pull", "--ff-only"))
 
 
 class SimulationTests(unittest.TestCase):

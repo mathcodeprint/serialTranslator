@@ -1,5 +1,7 @@
 # GasWorks ↔ ProLab Serial Translator
 
+Current version: **0.2.0**
+
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
 - **GasWorks sends:** `CR` (`0D`)
@@ -123,6 +125,18 @@ current user's application-settings directory, not beside the installed `.exe`.
 Every bridge start creates a separate timestamped session log; each session log
 still rotates at 5 MiB with three retained backups.
 
+## Updating a Git checkout
+
+When running the application from a cloned source checkout, choose **Help →
+Check for Updates…**. The app fetches the configured `origin` GitHub remote,
+compares the current branch with its upstream branch, and offers a fast-forward
+update when newer commits are available. It refuses to overwrite local changes
+or update while the serial bridge is running; stop the bridge and commit or
+stash any changes first. After a successful update, it restarts the GUI.
+
+The installed Windows PyInstaller bundle is not a Git checkout, so this menu
+only reports that a newer installed release must be installed manually.
+
 ### Build a Windows installer
 
 Install [Inno Setup 6](https://jrsoftware.org/isdl.php) on Windows, then run:
@@ -183,13 +197,15 @@ The GUI keeps serial work on background threads and shows the same traffic log
 live. GasWorks and ProLab each have their own baud rate, data bits, parity,
 stop bits, and XON/XOFF, RTS/CTS, and DSR/DTR flow-control settings.
 
-The main window opens as a session dashboard: use **Session Setup** to reveal
-the port and per-side serial settings, and keep the rest of the window focused
-on live activity. The activity view can filter new entries, copy or clear the
-visible history, pause automatic following, and retain a bounded number of
-lines. **Edit → Preferences** contains persistent startup/reconnect behavior,
+The main window keeps the port and per-side serial settings immediately
+available. Use **Session Setup** or **View → Compact mode** to hide them when a
+smaller, activity-focused dashboard is preferable; that choice is remembered.
+The activity view can filter new entries, copy or clear the visible history,
+pause automatic following, show the latest traffic, and retain a bounded number
+of lines. **Edit → Preferences** contains persistent startup/reconnect behavior,
 serial timing defaults, activity display options, logging, and stop-confirmation
-controls.
+controls. Keyboard shortcuts are **Ctrl+R** to refresh ports, **Ctrl+L** to
+clear traffic, and **Ctrl+S** to start or stop the bridge.
 
 The GUI retries a dropped or unavailable serial connection every three seconds
 by default. The status changes to **Reconnecting** while it retries; use

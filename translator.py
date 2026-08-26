@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -31,8 +32,60 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
+APP_VERSION = "0.2.0"
 TEMPLATES = {"Generic bidirectional": False, "GasWorks ↔ ProLab": True}
 WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
+
+
+@dataclass(frozen=True)
+class GitUpdateStatus:
+    """The result of comparing this source checkout with its GitHub upstream."""
+
+    behind: int
+    ahead: int
+    dirty: bool
+    current_commit: str
+    available_commit: str
+
+
+def source_repository_directory() -> Optional[Path]:
+    """Return the source checkout containing this application, if there is one."""
+    if getattr(sys, "frozen", False):
+        return None
+    directory = Path(__file__).resolve().parent
+    return directory if (directory / ".git").exists() else None
+
+
+def _git_output(repository: Path, *arguments: str) -> str:
+    """Run git in *repository* without a shell and return its standard output."""
+    completed = subprocess.run(
+        ["git", *arguments], cwd=repository, check=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def check_for_git_update(repository: Path) -> GitUpdateStatus:
+    """Fetch origin and report whether the checked-out upstream has new commits."""
+    _git_output(repository, "fetch", "origin", "--prune")
+    current = _git_output(repository, "rev-parse", "--short", "HEAD")
+    available = _git_output(repository, "log", "-1", "--format=%h %s", "@{upstream}")
+    ahead_behind = _git_output(repository, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+    ahead, behind = (int(value) for value in ahead_behind.split())
+    return GitUpdateStatus(
+        behind=behind,
+        ahead=ahead,
+        dirty=bool(_git_output(repository, "status", "--porcelain")),
+        current_commit=current,
+        available_commit=available,
+    )
+
+
+def apply_git_update(repository: Path) -> None:
+    """Fast-forward the current source branch, refusing to overwrite local work."""
+    if _git_output(repository, "status", "--porcelain"):
+        raise RuntimeError("Local changes are present; commit or stash them before updating.")
+    _git_output(repository, "pull", "--ff-only")
 
 
 def session_log_path(log_file: Optional[str], now: Optional[datetime] = None) -> Optional[str]:
@@ -924,6 +977,31 @@ class QueueLogHandler(logging.Handler):
             self.handleError(record)
 
 
+class Tooltip:
+    """A small hover hint for controls whose serial terminology is unfamiliar."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget, self.text, self.window = widget, text, None
+        widget.bind("<Enter>", self._show, add=True)
+        widget.bind("<Leave>", self._hide, add=True)
+
+    def _show(self, _event: object = None) -> None:
+        if self.window is not None:
+            return
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.window.geometry(f"+{x}+{y}")
+        ttk.Label(self.window, text=self.text, padding=(6, 3), relief="solid").pack()
+
+    def _hide(self, _event: object = None) -> None:
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
 class SerialBridgeController:
     """Run the bridge workers without blocking Tkinter's UI thread."""
 
@@ -1119,6 +1197,8 @@ class ProLabTranslatorGUI:
         self.test_bench: Optional[LinuxVirtualTestBench] = None
         self.test_clients: list[BaseTestClient] = []
         self.port_display_to_device: dict[str, str] = {}
+        self._update_check_in_progress = False
+        self.last_error = ""
         self.saved_settings = load_settings("translator_gui")
         self.profiles = load_settings("translator_profiles")
 
@@ -1165,6 +1245,9 @@ class ProLabTranslatorGUI:
             value=str(saved.get("log_file") or default_log_file)
         )
         self.status_var = tk.StringVar(value="Stopped")
+        self.last_traffic_var = tk.StringVar(value="Last traffic: none yet")
+        self.last_update_check_var = tk.StringVar(value="Updates not checked")
+        self.compact_mode_var = tk.BooleanVar(value=bool(saved.get("compact_mode", False)))
         self.activity_filter_var = tk.StringVar(value="")
         self.pause_follow_var = tk.BooleanVar(value=False)
         self.auto_scroll_var = tk.BooleanVar(value=bool(saved.get("auto_scroll", True)))
@@ -1173,6 +1256,7 @@ class ProLabTranslatorGUI:
         self.activity_font_size_var = tk.StringVar(value=str(saved.get("activity_font_size", "9")))
         self.gw_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
         self.pl_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
+        self.status_var.trace_add("write", lambda *_args: self._update_status_appearance())
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -1187,6 +1271,8 @@ class ProLabTranslatorGUI:
             font=("Segoe UI", 13, "bold"),
         )
         title.grid(row=0, column=0, sticky="w")
+
+        ttk.Label(outer, textvariable=self.last_traffic_var).grid(row=0, column=0, sticky="e")
 
         topology = ttk.Label(
             outer,
@@ -1244,6 +1330,10 @@ class ProLabTranslatorGUI:
             ports_frame, text="Refresh ports", command=self.refresh_ports
         )
         self.refresh_button.grid(row=0, column=4, rowspan=2, padx=(12, 0), sticky="ns")
+        self.recommended_defaults_button = ttk.Button(
+            ports_frame, text="Recommended defaults", command=self.restore_recommended_defaults
+        )
+        self.recommended_defaults_button.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
         settings_frame = ttk.LabelFrame(outer, text="Session setup: serial / translator settings", padding=6)
         settings_frame.grid(row=3, column=0, sticky="ew", pady=(6, 6))
@@ -1304,6 +1394,8 @@ class ProLabTranslatorGUI:
         self.log_entry.grid(row=0, column=1, sticky="ew")
         self.browse_button = ttk.Button(log_frame, text="Browse...", command=self.choose_log_file)
         self.browse_button.grid(row=0, column=2, padx=(6, 0))
+        self.open_log_folder_button = ttk.Button(log_frame, text="Open folder", command=self.open_log_folder)
+        self.open_log_folder_button.grid(row=0, column=3, padx=(6, 0))
 
         traffic_frame = ttk.LabelFrame(outer, text="Live traffic", padding=6)
         traffic_frame.grid(row=4, column=0, sticky="nsew")
@@ -1360,11 +1452,15 @@ class ProLabTranslatorGUI:
         self.console_button = ttk.Button(controls, text="Serial Console", command=self.open_serial_console)
         self.console_button.grid(row=0, column=5, padx=(6, 0))
 
-        ttk.Label(controls, text="Status:").grid(row=0, column=6, padx=(12, 4))
+        self.update_button = ttk.Button(controls, text="Check for Updates", command=self.check_for_updates)
+        self.update_button.grid(row=0, column=6, padx=(6, 0))
+        ttk.Label(controls, textvariable=self.last_update_check_var).grid(row=1, column=6, columnspan=2, sticky="e")
+
+        ttk.Label(controls, text="Status:").grid(row=0, column=7, padx=(12, 4))
         self.status_label = ttk.Label(
-            controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold")
+            controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold"), style="Status.stopped.TLabel"
         )
-        self.status_label.grid(row=0, column=7, sticky="e")
+        self.status_label.grid(row=0, column=8, sticky="e")
 
         self.config_widgets = [
             self.gw_port_combo,
@@ -1385,9 +1481,30 @@ class ProLabTranslatorGUI:
             self.log_entry,
             self.browse_button,
             self.refresh_button,
+            self.recommended_defaults_button,
         ]
-        self.session_setup_visible = True
-        self.toggle_session_setup()
+        self.session_setup_visible = not self.compact_mode_var.get()
+        if not self.session_setup_visible:
+            self.ports_frame.grid_remove()
+            self.settings_frame.grid_remove()
+        self.setup_button.configure(text="Session Setup" if not self.session_setup_visible else "Hide Setup")
+        self._configure_status_styles()
+        self._update_status_appearance()
+        self._bind_shortcuts()
+        for widget, text in (
+            (self.gw_port_combo, "Port connected to the GasWorks application."),
+            (self.pl_port_combo, "Port connected to the physical ProLab analyzer."),
+            (self.gw_parity_combo, "Parity adds an optional error-checking bit. Most instruments use N (none)."),
+            (self.pl_parity_combo, "Parity must match the ProLab serial configuration."),
+            (self.cr_wait_entry, "Wait briefly after CR so an incoming LF is not duplicated."),
+            (self.read_timeout_entry, "How long each serial read waits before checking again."),
+            (self.write_timeout_entry, "Maximum time allowed for a serial write."),
+            (self.gw_xonxoff_check, "Software flow control. Enable only if this device requires it."),
+            (self.pl_xonxoff_check, "Software flow control. Enable only if this device requires it."),
+            (self.gw_rtscts_check, "Hardware RTS/CTS flow control. Enable only if wired and required."),
+            (self.pl_rtscts_check, "Hardware RTS/CTS flow control. Enable only if wired and required."),
+        ):
+            Tooltip(widget, text)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
@@ -1413,17 +1530,197 @@ class ProLabTranslatorGUI:
         view_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
         view_menu.add_command(label="Serial Console…", command=self.open_serial_console)
         view_menu.add_command(label="View Log Files…", command=self.view_log_files)
+        view_menu.add_checkbutton(label="Compact mode", variable=self.compact_mode_var, command=self.set_compact_mode)
         menu.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu, tearoff=False)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", APP_NAME, parent=self.root))
+        help_menu.add_command(label="Check for Updates…", command=self.check_for_updates)
+        help_menu.add_command(
+            label="About",
+            command=lambda: messagebox.showinfo(
+                "About", f"{APP_NAME}\nVersion {APP_VERSION}", parent=self.root
+            ),
+        )
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.configure(menu=menu)
+
+    def _configure_status_styles(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("Status.running.TLabel", foreground="#187a3a")
+        style.configure("Status.connecting.TLabel", foreground="#9a6200")
+        style.configure("Status.reconnecting.TLabel", foreground="#9a6200")
+        style.configure("Status.error.TLabel", foreground="#a51d2d")
+        style.configure("Status.stopped.TLabel", foreground="#555555")
+        style.configure("Invalid.TEntry", fieldbackground="#ffe8e8")
+        style.configure("Invalid.TCombobox", fieldbackground="#ffe8e8")
+
+    def _update_status_appearance(self) -> None:
+        status = self.status_var.get().casefold()
+        if "error" in status or "failed" in status:
+            state = "error"
+        elif "reconnect" in status:
+            state = "reconnecting"
+        elif "start" in status or "check" in status or "updat" in status:
+            state = "connecting"
+        elif "running" in status:
+            state = "running"
+        else:
+            state = "stopped"
+        if hasattr(self, "status_label"):
+            self.status_label.configure(style=f"Status.{state}.TLabel")
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind_all("<Control-r>", lambda _event: (self.refresh_ports(), "break")[1])
+        self.root.bind_all("<Control-l>", lambda _event: (self.clear_traffic(), "break")[1])
+        self.root.bind_all("<Control-s>", lambda _event: (self.toggle_bridge_shortcut(), "break")[1])
+
+    def toggle_bridge_shortcut(self) -> None:
+        if self.controller.running:
+            self.stop_bridge()
+        else:
+            self.start_bridge()
+
+    def set_compact_mode(self) -> None:
+        desired_visible = not self.compact_mode_var.get()
+        if desired_visible != self.session_setup_visible:
+            self.toggle_session_setup(save=False)
+        self._save_settings()
+
+    def restore_recommended_defaults(self) -> None:
+        """Apply the documented GasWorks COM5/COM6 to ProLab COM4 topology."""
+        self.gw_port_var.set("COM6")
+        self.pl_port_var.set("COM4")
+        self.template_var.set("GasWorks ↔ ProLab")
+        for variable, value in (
+            (self.gw_baud_var, "9600"), (self.pl_baud_var, "9600"),
+            (self.gw_bytesize_var, "8"), (self.pl_bytesize_var, "8"),
+            (self.gw_parity_var, "N"), (self.pl_parity_var, "N"),
+            (self.gw_stopbits_var, "1"), (self.pl_stopbits_var, "1"),
+            (self.read_timeout_var, "10"), (self.cr_wait_var, "20"),
+            (self.write_timeout_var, "2.0"), (self.reconnect_delay_var, "3"),
+        ):
+            variable.set(value)
+        for variable in (self.gw_xonxoff_var, self.pl_xonxoff_var, self.gw_rtscts_var,
+                         self.pl_rtscts_var, self.gw_dsrdtr_var, self.pl_dsrdtr_var):
+            variable.set(False)
+        self.auto_reconnect_var.set(True)
+        self.refresh_ports()
+        self.status_var.set("Recommended defaults applied")
+
+    def open_log_folder(self) -> None:
+        directory = Path(self.log_file_var.get().strip() or settings_directory()).expanduser().parent
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            webbrowser.open(directory.resolve().as_uri())
+        except OSError as exc:
+            self.show_error("Open Log Folder", str(exc))
+
+    def check_for_updates(self) -> None:
+        """Check GitHub in a worker, leaving the Tkinter event loop responsive."""
+        if self._update_check_in_progress:
+            return
+        repository = source_repository_directory()
+        if repository is None:
+            messagebox.showinfo(
+                "Check for Updates",
+                "This installed application is not a Git source checkout. "
+                "Install a newer release to update it.",
+                parent=self.root,
+            )
+            return
+
+        self._update_check_in_progress = True
+        self.status_var.set("Checking GitHub for updates...")
+
+        def worker() -> None:
+            try:
+                result = check_for_git_update(repository)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_check_error(error))
+            else:
+                self.root.after(0, lambda: self._finish_update_check(result, repository))
+
+        threading.Thread(target=worker, name="check-for-updates", daemon=True).start()
+
+    def _finish_update_check_error(self, error: Exception) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last check failed: {datetime.now().strftime('%H:%M:%S')}")
+        self.status_var.set("Update check failed")
+        self.show_error("Check for Updates", f"Could not check the GitHub repository.\n\n{error}")
+
+    def _finish_update_check(self, result: GitUpdateStatus, repository: Path) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last checked: {datetime.now().strftime('%H:%M:%S')}")
+        if not result.behind:
+            self.status_var.set("Up to date")
+            extra = f"\n\nThis checkout also has {result.ahead} local commit(s) not on GitHub." if result.ahead else ""
+            messagebox.showinfo(
+                "Check for Updates",
+                f"You already have the latest version ({result.current_commit}).{extra}",
+                parent=self.root,
+            )
+            return
+        if result.dirty:
+            self.status_var.set("Update available")
+            messagebox.showwarning(
+                "Update Available",
+                f"GitHub has {result.behind} newer commit(s) ({result.available_commit}), "
+                "but this checkout has local changes. Commit or stash them before updating.",
+                parent=self.root,
+            )
+            return
+        if self.controller.running:
+            self.status_var.set("Update available")
+            messagebox.showinfo(
+                "Update Available",
+                f"GitHub has {result.behind} newer commit(s) ({result.available_commit}). "
+                "Stop the serial bridge, then check again to update safely.",
+                parent=self.root,
+            )
+            return
+        if messagebox.askyesno(
+            "Update Available",
+            f"GitHub has {result.behind} newer commit(s):\n{result.available_commit}\n\n"
+            "Update this checkout now? The application will restart after a successful update.",
+            parent=self.root,
+        ):
+            self._apply_update(repository)
+        else:
+            self.status_var.set("Update available")
+
+    def _apply_update(self, repository: Path) -> None:
+        self._update_check_in_progress = True
+        self.status_var.set("Updating from GitHub...")
+
+        def worker() -> None:
+            try:
+                apply_git_update(repository)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_error(error))
+            else:
+                self.root.after(0, lambda: self._restart_after_update(repository))
+
+        threading.Thread(target=worker, name="apply-update", daemon=True).start()
+
+    def _finish_update_error(self, error: Exception) -> None:
+        self._update_check_in_progress = False
+        self.status_var.set("Update failed")
+        self.show_error("Update Failed", f"Could not update from GitHub.\n\n{error}")
+
+    def _restart_after_update(self, repository: Path) -> None:
+        command = [sys.executable, str(Path(__file__).resolve()), "--gui"]
+        try:
+            subprocess.Popen(command, cwd=repository)
+        except OSError as exc:
+            self._finish_update_error(exc)
+            return
+        self._save_settings()
+        self.on_close()
 
     def open_serial_console(self) -> None:
         """Open a separate, raw serial terminal for an available device."""
         SerialConsole(self.root)
 
-    def toggle_session_setup(self) -> None:
+    def toggle_session_setup(self, save: bool = True) -> None:
         """Keep the dashboard activity-first while retaining quick setup access."""
         if self.session_setup_visible:
             self.ports_frame.grid_remove()
@@ -1435,6 +1732,29 @@ class ProLabTranslatorGUI:
             self.settings_frame.grid()
             self.session_setup_visible = True
             self.setup_button.configure(text="Hide Setup")
+        self.compact_mode_var.set(not self.session_setup_visible)
+        if save:
+            self._save_settings()
+
+    def show_error(self, title: str, detail: str) -> None:
+        """Show an actionable error dialog with support-ready copy text."""
+        self.last_error = f"{title}\n\n{detail}"
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        outer = ttk.Frame(dialog, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=detail, justify="left", wraplength=520).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        def copy_details() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.last_error)
+
+        ttk.Button(outer, text="Copy error details", command=copy_details).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(outer, text="Close", command=dialog.destroy).grid(row=1, column=1, sticky="e", pady=(12, 0))
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
     def open_preferences(self) -> None:
         window = tk.Toplevel(self.root)
@@ -1618,6 +1938,7 @@ class ProLabTranslatorGUI:
                 "activity_line_limit": self.activity_line_limit_var.get(),
                 "activity_font_size": self.activity_font_size_var.get(),
                 "confirm_stop": self.confirm_stop_var.get(),
+                "compact_mode": self.compact_mode_var.get(),
             },
         )
 
@@ -1679,6 +2000,39 @@ class ProLabTranslatorGUI:
             raise ValueError("Stop bits must be 1, 1.5, or 2")
         return mapping[value]
 
+    def _clear_validation(self) -> None:
+        for widget in getattr(self, "_validation_widgets", []):
+            try:
+                if isinstance(widget, ttk.Combobox):
+                    widget.configure(style="TCombobox")
+                else:
+                    widget.configure(style="TEntry")
+            except tk.TclError:
+                pass
+
+    def _mark_invalid_settings(self, message: str) -> None:
+        """Highlight the most likely field(s) when pre-start validation fails."""
+        self._clear_validation()
+        candidates: list[tk.Widget] = []
+        lower = message.casefold()
+        if "both" in lower or "different" in lower:
+            candidates = [self.gw_port_combo, self.pl_port_combo]
+        elif "baud" in lower:
+            candidates = [self.gw_baud_combo, self.pl_baud_combo]
+        elif "stop bits" in lower:
+            candidates = [self.gw_stopbits_combo, self.pl_stopbits_combo]
+        elif "write timeout" in lower:
+            candidates = [self.write_timeout_entry]
+        elif "timeout" in lower:
+            candidates = [self.read_timeout_entry, self.cr_wait_entry]
+        elif "reconnect" in lower:
+            candidates = [self.reconnect_delay_entry]
+        self._validation_widgets = candidates
+        for widget in candidates:
+            widget.configure(style="Invalid.TCombobox" if isinstance(widget, ttk.Combobox) else "Invalid.TEntry")
+        if candidates:
+            candidates[0].focus_set()
+
     def _build_settings(self) -> tuple[PortSettings, PortSettings, float, Optional[str]]:
         gw_port = self._device_from_combo_text(self.gw_port_var.get())
         pl_port = self._device_from_combo_text(self.pl_port_var.get())
@@ -1731,10 +2085,12 @@ class ProLabTranslatorGUI:
         return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False)
 
     def start_bridge(self) -> None:
+        self._clear_validation()
         try:
             gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr = self._build_settings()
         except (ValueError, TypeError) as exc:
-            messagebox.showerror("Invalid settings", str(exc), parent=self.root)
+            self._mark_invalid_settings(str(exc))
+            self.show_error("Invalid settings", str(exc))
             return
 
         self.status_var.set("Starting...")
@@ -1745,7 +2101,7 @@ class ProLabTranslatorGUI:
         except Exception as exc:
             self._set_running_ui(False)
             self.status_var.set("Stopped")
-            messagebox.showerror("Could not start bridge", str(exc), parent=self.root)
+            self.show_error("Could not start bridge", str(exc))
 
     def stop_bridge(self) -> None:
         if self.confirm_stop_var.get() and self.controller.running:
@@ -1834,6 +2190,13 @@ class ProLabTranslatorGUI:
         self.root.after(100, self.start_bridge)
 
     def _append_log(self, text: str) -> None:
+        if " | HEX: " in text:
+            prefix, hex_part = text.split(" | HEX: ", 1)
+            byte_count = len(hex_part.split(" | ASCII: ", 1)[0].split())
+            direction = prefix.split(" ", 2)[-1]
+            self.last_traffic_var.set(
+                f"Last traffic: {datetime.now().strftime('%H:%M:%S')} · {direction} · {byte_count} byte(s)"
+            )
         needle = self.activity_filter_var.get().strip().casefold()
         if needle and needle not in text.casefold():
             return
