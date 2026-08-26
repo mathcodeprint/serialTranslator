@@ -14,6 +14,7 @@ Typical com0com topology:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import re
 import subprocess
@@ -36,9 +37,10 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 GITHUB_REPOSITORY = "mathcodeprint/serialTranslator"
 WINDOWS_INSTALLER_NAME = "Serial-Protocol-Translator-Setup.exe"
+TRAFFIC_LOG_MODES = ("full", "metadata", "off")
 TEMPLATES = {"Generic bidirectional": False, "GasWorks ↔ ProLab": True}
 WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
 
@@ -61,6 +63,7 @@ class WindowsReleaseUpdate:
     version: str
     download_url: str
     release_name: str
+    sha256: str
 
 
 def semver_key(version: str) -> tuple[int, int, int]:
@@ -86,10 +89,15 @@ def check_for_windows_release_update() -> Optional[WindowsReleaseUpdate]:
         return None
     for asset in payload.get("assets", []):
         if asset.get("name") == WINDOWS_INSTALLER_NAME and asset.get("browser_download_url"):
+            digest = str(asset.get("digest") or "")
+            algorithm, separator, sha256 = digest.partition(":")
+            if algorithm != "sha256" or not separator or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                raise RuntimeError(f"Release {version} does not provide a valid SHA-256 installer digest.")
             return WindowsReleaseUpdate(
                 version=version,
                 download_url=str(asset["browser_download_url"]),
                 release_name=str(payload.get("name") or f"Version {version}"),
+                sha256=sha256.lower(),
             )
     raise RuntimeError(f"Release {version} does not include {WINDOWS_INSTALLER_NAME}.")
 
@@ -104,11 +112,17 @@ def download_windows_installer(update: WindowsReleaseUpdate) -> Path:
     temporary = Path(temporary_path)
     try:
         request = Request(update.download_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        digest = hashlib.sha256()
         with urlopen(request, timeout=60) as response, temporary.open("wb") as output:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
-        if temporary.stat().st_size < 1024 or temporary.read_bytes()[:2] != b"MZ":
+                digest.update(chunk)
+        with temporary.open("rb") as downloaded:
+            signature = downloaded.read(2)
+        if temporary.stat().st_size < 1024 or signature != b"MZ":
             raise RuntimeError("The downloaded update is not a valid Windows installer.")
+        if digest.hexdigest() != update.sha256:
+            raise RuntimeError("The downloaded update did not match GitHub's SHA-256 digest.")
         temporary.replace(destination)
         return destination
     except Exception:
@@ -252,9 +266,13 @@ class TrafficLogger:
         self,
         log_file: Optional[str],
         console: bool = True,
+        traffic_mode: str = "full",
         max_log_bytes: int = 5 * 1024 * 1024,
         backup_count: int = 3,
     ) -> None:
+        if traffic_mode not in TRAFFIC_LOG_MODES:
+            raise ValueError(f"traffic mode must be one of: {', '.join(TRAFFIC_LOG_MODES)}")
+        self.traffic_mode = traffic_mode
         self._logger = logging.getLogger("prolab_bridge")
         self._logger.setLevel(logging.INFO)
         self._logger.propagate = False
@@ -303,13 +321,16 @@ class TrafficLogger:
                 handler.close()
 
     def traffic(self, direction: str, data: bytes, note: str = "") -> None:
-        if not data:
+        if not data or self.traffic_mode == "off":
             return
         suffix = f"  [{note}]" if note else ""
-        line = (
-            f"{direction:<9} | HEX: {hex_view(data)} | "
-            f"ASCII: {ascii_view(data)}{suffix}"
-        )
+        if self.traffic_mode == "metadata":
+            line = f"{direction:<9} | {len(data)} byte(s){suffix}"
+        else:
+            line = (
+                f"{direction:<9} | HEX: {hex_view(data)} | "
+                f"ASCII: {ascii_view(data)}{suffix}"
+            )
         with self._lock:
             self._logger.info(line)
 
@@ -320,6 +341,34 @@ class TrafficLogger:
     def error(self, message: str) -> None:
         with self._lock:
             self._logger.error(message)
+
+
+class SessionMetrics:
+    """Thread-safe passive session health counters; never add protocol traffic."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.gw_to_pl_bytes = 0
+        self.pl_to_gw_bytes = 0
+        self.reconnects = 0
+        self.last_activity: Optional[float] = None
+
+    def record(self, direction: str, count: int) -> None:
+        with self._lock:
+            if direction == "gw_to_pl":
+                self.gw_to_pl_bytes += count
+            elif direction == "pl_to_gw":
+                self.pl_to_gw_bytes += count
+            self.last_activity = time.monotonic()
+
+    def reconnected(self) -> None:
+        with self._lock:
+            self.reconnects += 1
+
+    def summary(self) -> str:
+        with self._lock:
+            idle = "no traffic yet" if self.last_activity is None else f"idle {time.monotonic() - self.last_activity:.0f}s"
+            return f"Health: GW→PL {self.gw_to_pl_bytes} B · PL→GW {self.pl_to_gw_bytes} B · reconnects {self.reconnects} · {idle}"
 
 
 class CrLfNormalizer:
@@ -457,6 +506,7 @@ def gw_to_pl_worker(
     cr_wait_s: float,
     error_event: Optional[threading.Event] = None,
     normalize_cr: bool = True,
+    metrics: Optional[SessionMetrics] = None,
 ) -> None:
     normalizer = CrLfNormalizer() if normalize_cr else PassThroughNormalizer()
     pending_since: Optional[float] = None
@@ -478,6 +528,8 @@ def gw_to_pl_worker(
 
                 if output:
                     write_all(pl, output)
+                    if metrics is not None:
+                        metrics.record("gw_to_pl", len(output))
                     traffic_log.traffic(
                         "GW -> PL", output, "CR normalized" if changed else ""
                     )
@@ -490,6 +542,8 @@ def gw_to_pl_worker(
             ):
                 output, changed = normalizer.flush_pending()
                 write_all(pl, output)
+                if metrics is not None:
+                    metrics.record("gw_to_pl", len(output))
                 traffic_log.traffic(
                     "GW -> PL", output, "CR normalized" if changed else ""
                 )
@@ -507,6 +561,8 @@ def gw_to_pl_worker(
             try:
                 output, changed = normalizer.flush_pending()
                 write_all(pl, output)
+                if metrics is not None:
+                    metrics.record("gw_to_pl", len(output))
                 traffic_log.traffic(
                     "GW -> PL", output, "CR normalized during shutdown" if changed else ""
                 )
@@ -520,6 +576,7 @@ def pl_to_gw_worker(
     stop_event: threading.Event,
     traffic_log: TrafficLogger,
     error_event: Optional[threading.Event] = None,
+    metrics: Optional[SessionMetrics] = None,
 ) -> None:
     try:
         while not stop_event.is_set():
@@ -529,6 +586,8 @@ def pl_to_gw_worker(
 
             # Required transparent pass-through: no line-ending/framing changes.
             write_all(gw, data)
+            if metrics is not None:
+                metrics.record("pl_to_gw", len(data))
             traffic_log.traffic("PL -> GW", data)
 
     except (SerialException, OSError) as exc:
@@ -658,6 +717,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Traffic log file; use empty string to disable (default: prolab_translator.log)",
     )
     parser.add_argument(
+        "--traffic-log-mode", choices=TRAFFIC_LOG_MODES, default="full",
+        help="Traffic detail in logs: full, metadata, or off (default: full)",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable console traffic logging (file logging can remain enabled)",
@@ -686,7 +749,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     session_log = session_log_path(args.log_file)
-    traffic_log = TrafficLogger(session_log, console=not args.quiet)
+    traffic_log = TrafficLogger(session_log, console=not args.quiet, traffic_mode=args.traffic_log_mode)
 
     gw_settings = PortSettings(
         port=args.gw_port,
@@ -822,6 +885,7 @@ WINDOWS_TEST_PORTS = {
 class PortChoice:
     device: str
     description: str
+    identity: str = ""
 
     @property
     def display(self) -> str:
@@ -858,7 +922,13 @@ def discover_serial_ports(extra_devices: Iterable[str] = ()) -> list[PortChoice]
     for p in list_ports.comports():
         device = str(p.device)
         description = (p.description or "Serial port").strip()
-        found[_device_key(device)] = PortChoice(device, description)
+        serial_number = str(getattr(p, "serial_number", "") or "").strip()
+        vid, pid = getattr(p, "vid", None), getattr(p, "pid", None)
+        location = str(getattr(p, "location", "") or "").strip()
+        identity = f"serial:{serial_number}" if serial_number else ""
+        if not identity and vid is not None and pid is not None and location:
+            identity = f"usb:{vid:04x}:{pid:04x}:{location}"
+        found[_device_key(device)] = PortChoice(device, description, identity)
 
     if is_linux():
         for role, device in LINUX_TEST_ALIASES.items():
@@ -881,6 +951,17 @@ def discover_serial_ports(extra_devices: Iterable[str] = ()) -> list[PortChoice]
 def device_is_available(device: str, ports: Iterable[PortChoice]) -> bool:
     key = _device_key(device.strip())
     return any(_device_key(p.device) == key for p in ports)
+
+
+def device_for_identity(identity: str, ports: Iterable[PortChoice]) -> Optional[str]:
+    """Resolve a saved USB identity to its current OS-assigned port name."""
+    identity = identity.strip()
+    if not identity:
+        return None
+    for port in ports:
+        if port.identity == identity:
+            return port.device
+    return None
 
 
 def preferred_role_device(
@@ -1115,6 +1196,7 @@ class SerialBridgeController:
         auto_reconnect: bool,
         reconnect_delay_s: float,
         normalize_cr: bool = True,
+        traffic_mode: str = "metadata",
     ) -> None:
         with self._lock:
             if self.running:
@@ -1127,7 +1209,7 @@ class SerialBridgeController:
                 name="bridge-supervisor",
                 args=(
                     gw_settings, pl_settings, cr_wait_s, log_file,
-                    auto_reconnect, reconnect_delay_s, normalize_cr,
+                    auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode,
                 ),
                 daemon=True,
             )
@@ -1150,13 +1232,15 @@ class SerialBridgeController:
         auto_reconnect: bool,
         reconnect_delay_s: float,
         normalize_cr: bool,
+        traffic_mode: str,
     ) -> None:
         queue_handler: Optional[QueueLogHandler] = None
         traffic_log: Optional[TrafficLogger] = None
         terminal_error = False
+        metrics = SessionMetrics()
 
         try:
-            traffic_log = TrafficLogger(log_file, console=False)
+            traffic_log = TrafficLogger(log_file, console=False, traffic_mode=traffic_mode)
             queue_handler = QueueLogHandler(self.event_queue)
             queue_handler.setFormatter(
                 logging.Formatter(
@@ -1192,6 +1276,7 @@ class SerialBridgeController:
                 session_failed = False
                 try:
                     if attempt:
+                        metrics.reconnected()
                         message = f"Reconnecting (attempt {attempt})..."
                         traffic_log.info(message)
                         self.event_queue.put(("state", f"reconnecting|{message}"))
@@ -1202,20 +1287,24 @@ class SerialBridgeController:
                     t_gw_pl = threading.Thread(
                         target=gw_to_pl_worker,
                         name="gw-to-pl",
-                        args=(gw, pl, session_stop, traffic_log, cr_wait_s, None, normalize_cr),
+                        args=(gw, pl, session_stop, traffic_log, cr_wait_s, None, normalize_cr, metrics),
                         daemon=True,
                     )
                     t_pl_gw = threading.Thread(
                         target=pl_to_gw_worker,
                         name="pl-to-gw",
-                        args=(pl, gw, session_stop, traffic_log),
+                        args=(pl, gw, session_stop, traffic_log, None, metrics),
                         daemon=True,
                     )
                     t_gw_pl.start()
                     t_pl_gw.start()
                     traffic_log.info("Bridge running.")
                     self.event_queue.put(("state", "running|Bridge running"))
+                    last_metrics_report = 0.0
                     while not self.stop_event.wait(0.20):
+                        if time.monotonic() - last_metrics_report >= 1.0:
+                            self.event_queue.put(("metrics", metrics.summary()))
+                            last_metrics_report = time.monotonic()
                         if session_stop.is_set() or not t_gw_pl.is_alive() or not t_pl_gw.is_alive():
                             session_failed = True
                             session_stop.set()
@@ -1286,6 +1375,7 @@ class ProLabTranslatorGUI:
         self.test_bench: Optional[LinuxVirtualTestBench] = None
         self.test_clients: list[BaseTestClient] = []
         self.port_display_to_device: dict[str, str] = {}
+        self.port_device_to_identity: dict[str, str] = {}
         self._update_check_in_progress = False
         self.last_error = ""
         self.saved_settings = load_settings("translator_gui")
@@ -1303,9 +1393,11 @@ class ProLabTranslatorGUI:
     def _make_variables(self) -> None:
         saved = self.saved_settings
         self.gw_port_var = tk.StringVar(value=str(saved.get("gw_port", "")))
+        self.gw_port_identity = str(saved.get("gw_port_identity", ""))
         self.template_var = tk.StringVar(value=str(saved.get("template", "Generic bidirectional")))
         self.profile_var = tk.StringVar()
         self.pl_port_var = tk.StringVar(value=str(saved.get("pl_port", "")))
+        self.pl_port_identity = str(saved.get("pl_port_identity", ""))
         self.connection_summary_var = tk.StringVar(value="Configure the bridge before starting a session")
         self.gw_baud_var = tk.StringVar(value=str(saved.get("gw_baud", "9600")))
         self.pl_baud_var = tk.StringVar(value=str(saved.get("pl_baud", "9600")))
@@ -1333,8 +1425,10 @@ class ProLabTranslatorGUI:
         self.log_file_var = tk.StringVar(
             value=str(saved.get("log_file") or default_log_file)
         )
+        self.traffic_log_mode_var = tk.StringVar(value=str(saved.get("traffic_log_mode", "metadata")))
         self.status_var = tk.StringVar(value="Stopped")
         self.last_traffic_var = tk.StringVar(value="Last traffic: none yet")
+        self.session_health_var = tk.StringVar(value="Health: bridge stopped")
         self.last_update_check_var = tk.StringVar(value="Updates not checked")
         self.compact_mode_var = tk.BooleanVar(value=bool(saved.get("compact_mode", False)))
         self.activity_filter_var = tk.StringVar(value="")
@@ -1485,6 +1579,15 @@ class ProLabTranslatorGUI:
         self.browse_button.grid(row=0, column=2, padx=(6, 0))
         self.open_log_folder_button = ttk.Button(log_frame, text="Open folder", command=self.open_log_folder)
         self.open_log_folder_button.grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(log_frame, text="Traffic detail").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.traffic_log_mode_combo = ttk.Combobox(
+            log_frame, textvariable=self.traffic_log_mode_var, values=TRAFFIC_LOG_MODES,
+            state="readonly", width=12,
+        )
+        self.traffic_log_mode_combo.grid(row=1, column=1, sticky="w", pady=(5, 0))
+        ttk.Label(log_frame, text="Metadata avoids recording instrument/sample payloads.").grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=(6, 0), pady=(5, 0)
+        )
 
         traffic_frame = ttk.LabelFrame(outer, text="Live traffic", padding=6)
         traffic_frame.grid(row=4, column=0, sticky="nsew")
@@ -1544,6 +1647,7 @@ class ProLabTranslatorGUI:
         self.update_button = ttk.Button(controls, text="Check for Updates", command=self.check_for_updates)
         self.update_button.grid(row=0, column=6, padx=(6, 0))
         ttk.Label(controls, textvariable=self.last_update_check_var).grid(row=1, column=6, columnspan=2, sticky="e")
+        ttk.Label(controls, textvariable=self.session_health_var).grid(row=1, column=0, columnspan=6, sticky="w")
 
         ttk.Label(controls, text="Status:").grid(row=0, column=7, padx=(12, 4))
         self.status_label = ttk.Label(
@@ -1568,6 +1672,7 @@ class ProLabTranslatorGUI:
             self.auto_reconnect_check,
             self.reconnect_delay_entry,
             self.log_entry,
+            self.traffic_log_mode_combo,
             self.browse_button,
             self.refresh_button,
             self.recommended_defaults_button,
@@ -2036,6 +2141,10 @@ class ProLabTranslatorGUI:
         current_pl = self._device_from_combo_text(self.pl_port_var.get())
 
         ports = discover_serial_ports((current_gw, current_pl))
+        if not device_is_available(current_gw, ports):
+            current_gw = device_for_identity(self.gw_port_identity, ports) or current_gw
+        if not device_is_available(current_pl, ports):
+            current_pl = device_for_identity(self.pl_port_identity, ports) or current_pl
         if not current_gw and not current_pl:
             current_gw, current_pl = translator_default_devices(ports)
 
@@ -2047,6 +2156,7 @@ class ProLabTranslatorGUI:
             mapping[display] = port.device
 
         self.port_display_to_device = mapping
+        self.port_device_to_identity = {port.device: port.identity for port in ports}
         self.gw_port_combo["values"] = displays
         self.pl_port_combo["values"] = displays
 
@@ -2058,6 +2168,7 @@ class ProLabTranslatorGUI:
 
         self.gw_port_var.set(choose_display(current_gw or "COM6"))
         self.pl_port_var.set(choose_display(current_pl or "COM4"))
+        self._remember_current_port_identities()
         self._refresh_connection_summary()
         self._append_log(f"Detected {len(displays)} serial port(s).")
 
@@ -2068,12 +2179,15 @@ class ProLabTranslatorGUI:
 
     def _save_settings(self) -> None:
         """Persist UI choices without making serial operation depend on disk I/O."""
+        self._remember_current_port_identities()
         save_settings(
             "translator_gui",
             {
                 "gw_port": self._device_from_combo_text(self.gw_port_var.get()),
+                "gw_port_identity": self.gw_port_identity,
                 "template": self.template_var.get(),
                 "pl_port": self._device_from_combo_text(self.pl_port_var.get()),
+                "pl_port_identity": self.pl_port_identity,
                 "gw_baud": self.gw_baud_var.get(),
                 "pl_baud": self.pl_baud_var.get(),
                 "gw_bytesize": self.gw_bytesize_var.get(),
@@ -2095,6 +2209,7 @@ class ProLabTranslatorGUI:
                 "reconnect_delay_s": self.reconnect_delay_var.get(),
                 "start_minimized": self.start_minimized_var.get(),
                 "log_file": self.log_file_var.get(),
+                "traffic_log_mode": self.traffic_log_mode_var.get(),
                 "auto_scroll": self.auto_scroll_var.get(),
                 "activity_line_limit": self.activity_line_limit_var.get(),
                 "activity_font_size": self.activity_font_size_var.get(),
@@ -2102,6 +2217,15 @@ class ProLabTranslatorGUI:
                 "compact_mode": self.compact_mode_var.get(),
             },
         )
+
+    def _remember_current_port_identities(self) -> None:
+        """Keep the preferred hardware identity in sync with a user port selection."""
+        gw_device = self._device_from_combo_text(self.gw_port_var.get())
+        pl_device = self._device_from_combo_text(self.pl_port_var.get())
+        if gw_device in self.port_device_to_identity:
+            self.gw_port_identity = self.port_device_to_identity[gw_device]
+        if pl_device in self.port_device_to_identity:
+            self.pl_port_identity = self.port_device_to_identity[pl_device]
 
     def apply_activity_preferences(self) -> None:
         """Apply display-only settings without interrupting the bridge."""
@@ -2135,6 +2259,8 @@ class ProLabTranslatorGUI:
         for key, variable in (("gw_port", self.gw_port_var), ("pl_port", self.pl_port_var), ("template", self.template_var), ("gw_baud", self.gw_baud_var), ("pl_baud", self.pl_baud_var)):
             if key in profile:
                 variable.set(str(profile[key]))
+        self.gw_port_identity = str(profile.get("gw_port_identity", ""))
+        self.pl_port_identity = str(profile.get("pl_port_identity", ""))
         self.refresh_ports()
 
     def choose_log_file(self) -> None:
@@ -2243,12 +2369,15 @@ class ProLabTranslatorGUI:
             dsrdtr=self.pl_dsrdtr_var.get(), **common,
         )
         log_file = session_log_path(self.log_file_var.get().strip() or None)
-        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False)
+        traffic_mode = self.traffic_log_mode_var.get()
+        if traffic_mode not in TRAFFIC_LOG_MODES:
+            raise ValueError("Select a valid traffic detail mode")
+        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False), traffic_mode
 
     def start_bridge(self) -> None:
         self._clear_validation()
         try:
-            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr = self._build_settings()
+            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode = self._build_settings()
         except (ValueError, TypeError) as exc:
             self._mark_invalid_settings(str(exc))
             self.show_error("Invalid settings", str(exc))
@@ -2257,7 +2386,7 @@ class ProLabTranslatorGUI:
         self.status_var.set("Starting...")
         self._set_running_ui(True)
         try:
-            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr)
+            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode)
             self._save_settings()
         except Exception as exc:
             self._set_running_ui(False)
@@ -2389,6 +2518,8 @@ class ProLabTranslatorGUI:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
+                elif kind == "metrics":
+                    self.session_health_var.set(payload)
                 elif kind == "state":
                     state, _, message = payload.partition("|")
                     self.status_var.set(message or state.title())

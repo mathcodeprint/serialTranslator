@@ -1,6 +1,6 @@
 # GasWorks ↔ ProLab Serial Translator
 
-Current version: **0.3.0**
+Current version: **0.4.0**
 
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
@@ -140,7 +140,8 @@ stash any changes first. After a successful update, it restarts the GUI.
 The installed Windows PyInstaller bundle checks the project's GitHub Releases
 instead. When a newer release includes the standard installer asset
 `Serial-Protocol-Translator-Setup.exe`, the app offers to download it to the
-user settings directory, exits cleanly, installs it, and restarts. Source
+user settings directory, verifies GitHub's published SHA-256 digest, exits
+cleanly, installs it, and restarts. Source
 checkouts continue to use their Git upstream for updates.
 
 ### Build a Windows installer
@@ -216,6 +217,14 @@ of lines. **Edit → Preferences** contains persistent startup/reconnect behavio
 serial timing defaults, activity display options, logging, and stop-confirmation
 controls. Keyboard shortcuts are **Ctrl+R** to refresh ports, **Ctrl+L** to
 clear traffic, and **Ctrl+S** to start or stop the bridge.
+
+For privacy, GUI traffic detail defaults to **metadata**: it records direction
+and byte counts without retaining payload contents. Select **full** only for a
+short diagnostic session, or **off** to suppress traffic entries altogether.
+The session-health line reports passive byte totals, reconnect count, and idle
+time; it never sends probe commands to either instrument. Saved profiles also
+remember USB serial identities when available, so a moved USB adapter can be
+resolved to its new port name.
 
 The GUI retries a dropped or unavailable serial connection every three seconds
 by default. The status changes to **Reconnecting** while it retries; use

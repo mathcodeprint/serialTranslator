@@ -19,6 +19,7 @@ from unittest import mock
 from translator import (
     CrLfNormalizer,
     PortSettings,
+    PortChoice,
     SerialBridgeController,
     SerialException,
     TrafficLogger,
@@ -27,6 +28,7 @@ from translator import (
     build_parser,
     check_for_git_update,
     check_for_windows_release_update,
+    device_for_identity,
     gw_to_pl_worker,
     main,
     open_serial,
@@ -130,11 +132,12 @@ class WindowsReleaseUpdateTests(unittest.TestCase):
 
     def test_windows_release_update_uses_matching_installer_asset(self) -> None:
         payload = {
-            "tag_name": "v0.4.0",
-            "name": "Version 0.4.0",
+            "tag_name": "v0.5.0",
+            "name": "Version 0.5.0",
             "assets": [{
                 "name": "Serial-Protocol-Translator-Setup.exe",
                 "browser_download_url": "https://example.invalid/installer.exe",
+                "digest": "sha256:" + "a" * 64,
             }],
         }
 
@@ -152,8 +155,9 @@ class WindowsReleaseUpdateTests(unittest.TestCase):
             update = check_for_windows_release_update()
         self.assertIsNotNone(update)
         assert update is not None
-        self.assertEqual(update.version, "0.4.0")
+        self.assertEqual(update.version, "0.5.0")
         self.assertEqual(update.download_url, "https://example.invalid/installer.exe")
+        self.assertEqual(update.sha256, "a" * 64)
 
 
 class SimulationTests(unittest.TestCase):
@@ -187,6 +191,24 @@ class TrafficLoggerTests(unittest.TestCase):
 
             self.assertTrue(log_path.exists())
             self.assertTrue(log_path.with_name("bridge.log.1").exists())
+
+    def test_metadata_mode_does_not_record_payload_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "bridge.log"
+            logger = TrafficLogger(str(log_path), console=False, traffic_mode="metadata")
+            try:
+                logger.traffic("GW RX", b"sensitive sample 42\r")
+            finally:
+                logger.close()
+            contents = log_path.read_text(encoding="utf-8")
+            self.assertIn("20 byte(s)", contents)
+            self.assertNotIn("sensitive", contents)
+
+
+class PortIdentityTests(unittest.TestCase):
+    def test_device_for_identity_resolves_changed_device_name(self) -> None:
+        ports = [PortChoice("/dev/ttyUSB1", "Analyzer", "serial:PROLAB-42")]
+        self.assertEqual(device_for_identity("serial:PROLAB-42", ports), "/dev/ttyUSB1")
 
 
 class ReconnectTests(unittest.TestCase):
