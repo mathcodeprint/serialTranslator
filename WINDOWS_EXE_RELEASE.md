@@ -1,4 +1,4 @@
-# Serial Protocol Translator for Windows — v0.5.1
+# Serial Protocol Translator for Windows — v0.5.2
 
 This release provides the Windows installer for the GasWorks ↔ ProLab Serial
 Translator.

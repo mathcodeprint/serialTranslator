@@ -46,6 +46,18 @@ jobs:
           & "dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe" --runtime-check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Verify installed package contains Python runtime
+        shell: pwsh
+        run: |
+          $installer = "dist-installer\Serial-Protocol-Translator-Setup.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "serial-translator-installed"
+          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
+          if ($LASTEXITCODE -ne 0) { throw "The installer returned exit code $LASTEXITCODE." }
+          $pythonDll = Get-ChildItem -Path $installDir -Recurse -Filter "python*.dll" | Select-Object -First 1
+          if ($null -eq $pythonDll) { throw "Installed bundle is missing its Python runtime DLL." }
+          & "$installDir\GasWorks-ProLab-Serial-Translator.exe" --runtime-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:

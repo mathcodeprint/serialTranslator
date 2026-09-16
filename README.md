@@ -1,6 +1,6 @@
 # GasWorks ↔ ProLab Serial Translator
 
-Current version: **0.5.1**
+Current version: **0.5.2**
 
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
@@ -171,7 +171,9 @@ installer asset required by the installed-app updater. You can rerun the
 workflow manually and enter an existing release tag to rebuild or replace its
 installer asset. Before uploading, the workflow runs the frozen executable's
 dependency self-check so a release cannot be published with missing GUI, tray,
-serial, or Pillow modules.
+serial, or Pillow modules. It also installs the generated setup into a clean
+temporary directory and verifies the installed bundle contains its Python DLL
+before publishing.
 
 To download the official Inno Setup installer and build without opening a web
 browser, run:
