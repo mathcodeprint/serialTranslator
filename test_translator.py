@@ -23,6 +23,8 @@ from translator import (
     SerialBridgeController,
     SerialException,
     TrafficLogger,
+    TerminalTrafficRenderer,
+    QueueLogHandler,
     apply_git_update,
     ascii_view,
     build_parser,
@@ -68,6 +70,45 @@ class CrLfNormalizerTests(unittest.TestCase):
     def test_non_terminated_data_is_unchanged(self) -> None:
         normalizer = CrLfNormalizer()
         self.assertEqual(normalizer.feed(b"\x00\xffpayload"), (b"\x00\xffpayload", False))
+
+
+class TerminalTrafficTests(unittest.TestCase):
+    def test_character_reads_form_terminal_lines(self) -> None:
+        renderer = TerminalTrafficRenderer()
+        result = "".join(renderer.feed("GW -> PL", bytes([value])) for value in b"STATUS\r\nNEXT\r")
+        self.assertEqual(result, "STATUS\nNEXT\n")
+
+    def test_binary_bytes_and_repeated_line_breaks_are_visible(self) -> None:
+        renderer = TerminalTrafficRenderer()
+        self.assertEqual(renderer.feed("PL -> GW", b"\x00\xffA\tB\r\n\r\n"), "\\x00\\xFFA\tB\n\n")
+
+    def test_direction_switch_separates_partial_lines_without_duplicate_rx(self) -> None:
+        renderer = TerminalTrafficRenderer()
+        self.assertEqual(renderer.feed("GW RX", b"CMD\r"), "")
+        self.assertEqual(renderer.feed("GW -> PL", b"CMD"), "CMD")
+        self.assertEqual(renderer.feed("PL -> GW", b"OK\r"), "\nOK\n")
+        self.assertEqual(renderer.feed("PL -> GW", b"\n"), "")
+
+    def test_queue_delivers_bytes_only_in_full_mode(self) -> None:
+        for mode in ("full", "metadata", "off"):
+            with self.subTest(mode=mode):
+                events = queue.Queue()
+                logger = TrafficLogger(None, console=False, traffic_mode=mode)
+                logger.add_handler(QueueLogHandler(events))
+                try:
+                    logger.traffic("PL -> GW", b"A\x00\xff\r\n")
+                    if mode == "off":
+                        self.assertTrue(events.empty())
+                    else:
+                        kind, payload = events.get_nowait()
+                        if mode == "full":
+                            self.assertEqual(kind, "traffic")
+                            self.assertEqual(payload[:2], ("PL -> GW", b"A\x00\xff\r\n"))
+                        else:
+                            self.assertEqual(kind, "log")
+                            self.assertNotIn("HEX:", payload)
+                finally:
+                    logger.close()
 
 
 class CliValidationTests(unittest.TestCase):
