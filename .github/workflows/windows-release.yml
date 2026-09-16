@@ -43,20 +43,22 @@ jobs:
       - name: Verify frozen runtime dependencies
         shell: pwsh
         run: |
-          & "dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe" --runtime-check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $check = Start-Process -FilePath "dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe" -ArgumentList "--runtime-check" -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw "Frozen runtime check failed with exit code $($check.ExitCode)." }
 
       - name: Verify installed package contains Python runtime
         shell: pwsh
         run: |
           $installer = "dist-installer\Serial-Protocol-Translator-Setup.exe"
           $installDir = Join-Path $env:RUNNER_TEMP "serial-translator-installed"
-          & $installer /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- "/DIR=$installDir"
-          if ($LASTEXITCODE -ne 0) { throw "The installer returned exit code $LASTEXITCODE." }
+          # GUI executables must finish before checking their exit status or installed files.
+          $installArgs = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR="{0}"' -f $installDir
+          $install = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "The installer returned exit code $($install.ExitCode)." }
           $pythonDll = Get-ChildItem -Path $installDir -Recurse -Filter "python*.dll" | Select-Object -First 1
           if ($null -eq $pythonDll) { throw "Installed bundle is missing its Python runtime DLL." }
-          & "$installDir\GasWorks-ProLab-Serial-Translator.exe" --runtime-check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $check = Start-Process -FilePath "$installDir\GasWorks-ProLab-Serial-Translator.exe" -ArgumentList "--runtime-check" -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw "Installed runtime check failed with exit code $($check.ExitCode)." }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
