@@ -217,8 +217,16 @@ rotates at 5 MiB and retains three backups.
 py translator.py --gui
 ```
 
-The GUI keeps serial work on background threads and shows the same traffic log
-live. GasWorks and ProLab each have their own baud rate, data bits, parity,
+The GUI keeps serial work on background threads and displays traffic live.
+With **Traffic detail → full**, the default **Terminal** view joins characters
+across serial reads, breaking lines on CR, LF, or CR+LF (including split reads).
+GasWorks-to-ProLab traffic is blue and ProLab-to-GasWorks traffic is green;
+switching directions starts a new line if needed. Commands appear once, after
+normalization. Non-printable bytes other than tabs and line breaks appear as
+`\xNN`; this is a stream display, not an ANSI terminal emulator.
+Select **Diagnostic** for timestamped hex/ASCII entries and entry filtering.
+Switching views clears the visible history. Saved diagnostic files retain
+their timestamped per-read format. GasWorks and ProLab each have their own baud rate, data bits, parity,
 stop bits, and XON/XOFF, RTS/CTS, and DSR/DTR flow-control settings.
 
 The main window keeps the port and per-side serial settings immediately

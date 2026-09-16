@@ -349,7 +349,8 @@ class TrafficLogger:
                 f"ASCII: {ascii_view(data)}{suffix}"
             )
         with self._lock:
-            self._logger.info(line)
+            extra = {"traffic_direction": direction, "traffic_data": data} if self.traffic_mode == "full" else {}
+            self._logger.info(line, extra=extra)
 
     def info(self, message: str) -> None:
         with self._lock:
@@ -1150,16 +1151,50 @@ class TrayIcon:
             self.icon.stop()
 
 
-class QueueLogHandler(logging.Handler):
-    """Send formatted Python logging records to a thread-safe queue."""
+class TerminalTrafficRenderer:
+    """Render arbitrary byte chunks for display without changing serial data."""
 
-    def __init__(self, output_queue: queue.Queue[tuple[str, str]]) -> None:
+    def __init__(self) -> None:
+        self.direction = ""
+        self.at_line_start = True
+        self.previous_cr: dict[str, bool] = {}
+
+    def feed(self, direction: str, data: bytes) -> str:
+        # GW RX duplicates the command subsequently logged as GW -> PL.
+        if direction == "GW RX":
+            return ""
+        output = []
+        if direction != self.direction and not self.at_line_start:
+            output.append("\n")
+            self.at_line_start = True
+        self.direction = direction
+        for value in data:
+            previous_cr = self.previous_cr.get(direction, False)
+            self.previous_cr[direction] = value == 13
+            if value == 10 and previous_cr:
+                continue
+            if value in (10, 13):
+                output.append("\n")
+                self.at_line_start = True
+            else:
+                output.append(chr(value) if 32 <= value <= 126 or value == 9 else f"\\x{value:02X}")
+                self.at_line_start = False
+        return "".join(output)
+
+
+class QueueLogHandler(logging.Handler):
+    """Queue diagnostic records and full-detail traffic for the UI thread."""
+
+    def __init__(self, output_queue: queue.Queue[tuple[str, object]]) -> None:
         super().__init__()
         self.output_queue = output_queue
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self.output_queue.put(("log", self.format(record)))
+            if hasattr(record, "traffic_data"):
+                self.output_queue.put(("traffic", (record.traffic_direction, record.traffic_data, self.format(record))))
+            else:
+                self.output_queue.put(("log", self.format(record)))
         except Exception:
             self.handleError(record)
 
@@ -1192,7 +1227,7 @@ class Tooltip:
 class SerialBridgeController:
     """Run the bridge workers without blocking Tkinter's UI thread."""
 
-    def __init__(self, event_queue: queue.Queue[tuple[str, str]]) -> None:
+    def __init__(self, event_queue: queue.Queue[tuple[str, object]]) -> None:
         self.event_queue = event_queue
         self.stop_event = threading.Event()
         self._supervisor: Optional[threading.Thread] = None
@@ -1266,7 +1301,7 @@ class SerialBridgeController:
                 )
             )
             # TrafficLogger owns this logger.  Adding a GUI handler preserves its
-            # normal file logging while also mirroring every line into Tkinter.
+            # normal file logging while delivering traffic bytes to Tkinter.
             traffic_log.add_handler(queue_handler)
 
             traffic_log.info(f"Starting {APP_NAME}")
@@ -1387,7 +1422,8 @@ class ProLabTranslatorGUI:
         self.root.geometry("900x640")
         self.root.minsize(720, 500)
 
-        self.event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.terminal_renderer = TerminalTrafficRenderer()
         self.controller = SerialBridgeController(self.event_queue)
         self.test_bench: Optional[LinuxVirtualTestBench] = None
         self.test_clients: list[BaseTestClient] = []
@@ -1449,6 +1485,7 @@ class ProLabTranslatorGUI:
         self.last_update_check_var = tk.StringVar(value="Updates not checked")
         self.compact_mode_var = tk.BooleanVar(value=bool(saved.get("compact_mode", False)))
         self.activity_filter_var = tk.StringVar(value="")
+        self.traffic_view_var = tk.StringVar(value="Terminal")
         self.pause_follow_var = tk.BooleanVar(value=False)
         self.auto_scroll_var = tk.BooleanVar(value=bool(saved.get("auto_scroll", True)))
         self.activity_line_limit_var = tk.StringVar(value=str(saved.get("activity_line_limit", "2000")))
@@ -1621,15 +1658,24 @@ class ProLabTranslatorGUI:
         ttk.Button(activity_tools, text="Clear", command=self.clear_traffic).grid(row=0, column=3, padx=(4, 0))
         self.pause_follow_check = ttk.Checkbutton(activity_tools, text="Pause follow", variable=self.pause_follow_var)
         self.pause_follow_check.grid(row=0, column=4, padx=(8, 0))
+        self.traffic_view_combo = ttk.Combobox(
+            activity_tools, textvariable=self.traffic_view_var,
+            values=("Terminal", "Diagnostic"), state="readonly", width=11,
+        )
+        self.traffic_view_combo.grid(row=0, column=5, padx=(6, 0))
+        self.traffic_view_combo.bind("<<ComboboxSelected>>", self.change_traffic_view)
 
         self.traffic_text = tk.Text(
             traffic_frame,
-            wrap="none",
+            wrap="char",
             font=("Consolas", 9),
             height=12,
             state="disabled",
         )
         self.traffic_text.grid(row=1, column=0, sticky="nsew")
+        self.traffic_text.tag_configure("GW -> PL", foreground="#145DA0")
+        self.traffic_text.tag_configure("PL -> GW", foreground="#217346")
+        self.activity_filter_entry.configure(state="disabled")
 
         yscroll = ttk.Scrollbar(traffic_frame, orient="vertical", command=self.traffic_text.yview)
         yscroll.grid(row=1, column=1, sticky="ns")
@@ -2504,11 +2550,36 @@ class ProLabTranslatorGUI:
             self.last_traffic_var.set(
                 f"Last traffic: {datetime.now().strftime('%H:%M:%S')} · {direction} · {byte_count} byte(s)"
             )
-        needle = self.activity_filter_var.get().strip().casefold()
+        needle = self.activity_filter_var.get().strip().casefold() if self.traffic_view_var.get() == "Diagnostic" else ""
         if needle and needle not in text.casefold():
             return
         self.traffic_text.configure(state="normal")
+        if not self.terminal_renderer.at_line_start:
+            self.traffic_text.insert("end", "\n")
+        self.terminal_renderer = TerminalTrafficRenderer()
         self.traffic_text.insert("end", text.rstrip("\n") + "\n")
+        self._trim_traffic()
+
+    def _append_traffic(self, direction: str, data: bytes, diagnostic: str) -> None:
+        self.last_traffic_var.set(
+            f"Last traffic: {datetime.now().strftime('%H:%M:%S')} · {direction} · {len(data)} byte(s)"
+        )
+        if self.traffic_view_var.get() == "Diagnostic":
+            self._append_log(diagnostic)
+            return
+        text = self.terminal_renderer.feed(direction, data)
+        if text:
+            self.traffic_text.configure(state="normal")
+            self.traffic_text.insert("end", text, (direction,))
+            self._trim_traffic()
+
+    def change_traffic_view(self, _event: object = None) -> None:
+        self.clear_traffic()
+        terminal = self.traffic_view_var.get() == "Terminal"
+        self.traffic_text.configure(wrap="char" if terminal else "none")
+        self.activity_filter_entry.configure(state="disabled" if terminal else "normal")
+
+    def _trim_traffic(self) -> None:
         try:
             line_limit = max(100, int(self.activity_line_limit_var.get()))
         except ValueError:
@@ -2516,11 +2587,17 @@ class ProLabTranslatorGUI:
         line_count = int(self.traffic_text.index("end-1c").split(".")[0])
         if line_count > line_limit:
             self.traffic_text.delete("1.0", f"{line_count - line_limit + 1}.0")
+        # Bound streams which never send a line terminator as well.
+        character_limit = min(line_limit * 512, 1_000_000)
+        character_count = int(self.traffic_text.count("1.0", "end-1c", "chars")[0])
+        if character_count > character_limit:
+            self.traffic_text.delete("1.0", f"1.0+{character_count - character_limit}c")
         if self.auto_scroll_var.get() and not self.pause_follow_var.get():
             self.traffic_text.see("end")
         self.traffic_text.configure(state="disabled")
 
     def clear_traffic(self) -> None:
+        self.terminal_renderer = TerminalTrafficRenderer()
         self.traffic_text.configure(state="normal")
         self.traffic_text.delete("1.0", "end")
         self.traffic_text.configure(state="disabled")
@@ -2535,6 +2612,8 @@ class ProLabTranslatorGUI:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
+                elif kind == "traffic":
+                    self._append_traffic(*payload)
                 elif kind == "metrics":
                     self.session_health_var.set(payload)
                 elif kind == "state":
