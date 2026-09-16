@@ -1,6 +1,6 @@
 ; Build after scripts\build-windows.bat using Inno Setup 6.
 #define AppName "Serial Protocol Translator"
-#define AppVersion "0.2.0"
+#define AppVersion "0.5.2"
 #define AppPublisher "Serial Protocol Translator"
 #define AppExeName "GasWorks-ProLab-Serial-Translator.exe"
 
@@ -19,6 +19,7 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName}
+SetupIconFile=..\assets\serial-protocol-translator.ico
 
 [Files]
 Source: "..\dist\GasWorks-ProLab-Serial-Translator\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
@@ -27,8 +28,8 @@ Source: "..\dist\GasWorks-ProLab-Serial-Translator\*"; DestDir: "{app}"; Flags: 
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent

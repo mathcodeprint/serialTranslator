@@ -1,5 +1,7 @@
 # GasWorks ↔ ProLab Serial Translator
 
+Current version: **0.5.2**
+
 A small Python/pySerial bridge that fixes the serial command terminator mismatch:
 
 - **GasWorks sends:** `CR` (`0D`)
@@ -118,10 +120,29 @@ This produces a windowed, one-folder application at:
 dist\GasWorks-ProLab-Serial-Translator\GasWorks-ProLab-Serial-Translator.exe
 ```
 
+The build embeds the supplied application icon. The Windows installer uses it
+for the installer, Start Menu entry, and optional Desktop shortcut.
+
 The application stores its default GUI traffic log and saved settings in the
 current user's application-settings directory, not beside the installed `.exe`.
 Every bridge start creates a separate timestamped session log; each session log
 still rotates at 5 MiB with three retained backups.
+
+## Updating a Git checkout
+
+When running the application from a cloned source checkout, choose **Help →
+Check for Updates…**. The app fetches the configured `origin` GitHub remote,
+compares the current branch with its upstream branch, and offers a fast-forward
+update when newer commits are available. It refuses to overwrite local changes
+or update while the serial bridge is running; stop the bridge and commit or
+stash any changes first. After a successful update, it restarts the GUI.
+
+The installed Windows PyInstaller bundle checks the project's GitHub Releases
+instead. When a newer release includes the standard installer asset
+`Serial-Protocol-Translator-Setup.exe`, the app offers to download it to the
+user settings directory, verifies GitHub's published SHA-256 digest, exits
+cleanly, installs it, and restarts. Source
+checkouts continue to use their Git upstream for updates.
 
 ### Build a Windows installer
 
@@ -136,6 +157,23 @@ It builds the application bundle and produces
 Start Menu shortcut and can optionally create a Desktop shortcut. It does not
 install com0com; install and configure that separately only when your topology
 needs virtual COM-port pairs.
+
+For installed-app automatic updates, attach that exact installer filename to
+the corresponding GitHub Release and use a semantic release tag such as
+`v0.3.0`.
+
+### Automated Windows releases
+
+GitHub Actions builds the Windows executable and Inno Setup installer for pull
+requests, then uploads the installer as an artifact. Pushing a semantic tag
+such as `v0.4.0` also publishes (or updates) a GitHub Release with the exact
+installer asset required by the installed-app updater. You can rerun the
+workflow manually and enter an existing release tag to rebuild or replace its
+installer asset. Before uploading, the workflow runs the frozen executable's
+dependency self-check so a release cannot be published with missing GUI, tray,
+serial, or Pillow modules. It also installs the generated setup into a clean
+temporary directory and verifies the installed bundle contains its Python DLL
+before publishing.
 
 To download the official Inno Setup installer and build without opening a web
 browser, run:
@@ -183,6 +221,24 @@ The GUI keeps serial work on background threads and shows the same traffic log
 live. GasWorks and ProLab each have their own baud rate, data bits, parity,
 stop bits, and XON/XOFF, RTS/CTS, and DSR/DTR flow-control settings.
 
+The main window keeps the port and per-side serial settings immediately
+available. Use **Session Setup** or **View → Compact mode** to hide them when a
+smaller, activity-focused dashboard is preferable; that choice is remembered.
+The activity view can filter new entries, copy or clear the visible history,
+pause automatic following, show the latest traffic, and retain a bounded number
+of lines. **Edit → Preferences** contains persistent startup/reconnect behavior,
+serial timing defaults, activity display options, logging, and stop-confirmation
+controls. Keyboard shortcuts are **Ctrl+R** to refresh ports, **Ctrl+L** to
+clear traffic, and **Ctrl+S** to start or stop the bridge.
+
+For privacy, GUI traffic detail defaults to **metadata**: it records direction
+and byte counts without retaining payload contents. Select **full** only for a
+short diagnostic session, or **off** to suppress traffic entries altogether.
+The session-health line reports passive byte totals, reconnect count, and idle
+time; it never sends probe commands to either instrument. Saved profiles also
+remember USB serial identities when available, so a moved USB adapter can be
+resolved to its new port name.
+
 The GUI retries a dropped or unavailable serial connection every three seconds
 by default. The status changes to **Reconnecting** while it retries; use
 **Stop Bridge** to stop retrying, or turn off **Auto reconnect** for a
@@ -219,8 +275,9 @@ scripts/install-linux-mint.sh
 ```
 
 It creates a virtual environment under `~/.local/share/serial-protocol-translator`
-and adds **Serial Protocol Translator** to the Mint application menu. If Mint's
-tray backend packages are missing, install them (administrator password needed):
+and adds **Serial Protocol Translator** to the Mint application menu and
+Desktop, both with the supplied application icon. If Mint's tray backend
+packages are missing, install them (administrator password needed):
 
 ```bash
 scripts/install-linux-mint.sh --system-deps

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import queue
 import select
@@ -18,16 +19,22 @@ from unittest import mock
 from translator import (
     CrLfNormalizer,
     PortSettings,
+    PortChoice,
     SerialBridgeController,
     SerialException,
     TrafficLogger,
+    apply_git_update,
     ascii_view,
     build_parser,
+    check_for_git_update,
+    check_for_windows_release_update,
+    device_for_identity,
     gw_to_pl_worker,
     main,
     open_serial,
     pl_to_gw_worker,
     session_log_path,
+    semver_key,
     simulated_traffic,
 )
 
@@ -92,6 +99,67 @@ class DisplayTests(unittest.TestCase):
         self.assertEqual(ascii_view(b"A\r\n\t\x00"), r"A\r\n\t.")
 
 
+class GitUpdateTests(unittest.TestCase):
+    def test_check_for_git_update_reports_remote_commits_and_dirty_worktree(self) -> None:
+        outputs = iter(("", "abc1234", "def5678 New release", "2\t3", " M translator.py"))
+        with mock.patch("translator._git_output", side_effect=lambda *_args: next(outputs)) as git:
+            result = check_for_git_update(Path("/example/repository"))
+
+        self.assertEqual(result.current_commit, "abc1234")
+        self.assertEqual(result.available_commit, "def5678 New release")
+        self.assertEqual(result.ahead, 2)
+        self.assertEqual(result.behind, 3)
+        self.assertTrue(result.dirty)
+        self.assertEqual(git.call_args_list[0].args[1:], ("fetch", "origin", "--prune"))
+
+    def test_apply_git_update_refuses_dirty_checkout(self) -> None:
+        with mock.patch("translator._git_output", return_value=" M translator.py") as git:
+            with self.assertRaisesRegex(RuntimeError, "Local changes"):
+                apply_git_update(Path("/example/repository"))
+        self.assertEqual(git.call_count, 1)
+
+    def test_apply_git_update_uses_fast_forward_only(self) -> None:
+        with mock.patch("translator._git_output", side_effect=("", "")) as git:
+            apply_git_update(Path("/example/repository"))
+        self.assertEqual(git.call_args_list[1].args[1:], ("pull", "--ff-only"))
+
+
+class WindowsReleaseUpdateTests(unittest.TestCase):
+    def test_semver_key_accepts_normal_release_tags(self) -> None:
+        self.assertEqual(semver_key("v1.2.3"), (1, 2, 3))
+        with self.assertRaises(ValueError):
+            semver_key("release-1.2.3")
+
+    def test_windows_release_update_uses_matching_installer_asset(self) -> None:
+        payload = {
+            "tag_name": "v0.7.0",
+            "name": "Version 0.7.0",
+            "assets": [{
+                "name": "Serial-Protocol-Translator-Setup.exe",
+                "browser_download_url": "https://example.invalid/installer.exe",
+                "digest": "sha256:" + "a" * 64,
+            }],
+        }
+
+        class Response:
+            def read(self) -> bytes:
+                return json.dumps(payload).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                pass
+
+        with mock.patch("translator.urlopen", return_value=Response()):
+            update = check_for_windows_release_update()
+        self.assertIsNotNone(update)
+        assert update is not None
+        self.assertEqual(update.version, "0.7.0")
+        self.assertEqual(update.download_url, "https://example.invalid/installer.exe")
+        self.assertEqual(update.sha256, "a" * 64)
+
+
 class SimulationTests(unittest.TestCase):
     def test_simulated_traffic_models_the_protocol_contract(self) -> None:
         exchange = simulated_traffic()
@@ -123,6 +191,24 @@ class TrafficLoggerTests(unittest.TestCase):
 
             self.assertTrue(log_path.exists())
             self.assertTrue(log_path.with_name("bridge.log.1").exists())
+
+    def test_metadata_mode_does_not_record_payload_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "bridge.log"
+            logger = TrafficLogger(str(log_path), console=False, traffic_mode="metadata")
+            try:
+                logger.traffic("GW RX", b"sensitive sample 42\r")
+            finally:
+                logger.close()
+            contents = log_path.read_text(encoding="utf-8")
+            self.assertIn("20 byte(s)", contents)
+            self.assertNotIn("sensitive", contents)
+
+
+class PortIdentityTests(unittest.TestCase):
+    def test_device_for_identity_resolves_changed_device_name(self) -> None:
+        ports = [PortChoice("/dev/ttyUSB1", "Analyzer", "serial:PROLAB-42")]
+        self.assertEqual(device_for_identity("serial:PROLAB-42", ports), "/dev/ttyUSB1")
 
 
 class ReconnectTests(unittest.TestCase):

@@ -14,11 +14,17 @@ Typical com0com topology:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
+import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import webbrowser
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -31,8 +37,175 @@ from serial.tools import list_ports
 
 
 APP_NAME = "Serial Protocol Translator"
+APP_VERSION = "0.5.2"
+GITHUB_REPOSITORY = "mathcodeprint/serialTranslator"
+WINDOWS_INSTALLER_NAME = "Serial-Protocol-Translator-Setup.exe"
+TRAFFIC_LOG_MODES = ("full", "metadata", "off")
 TEMPLATES = {"Generic bidirectional": False, "GasWorks ↔ ProLab": True}
 WINDOWS_STARTUP_VALUE = "GasWorksProLabSerialTranslator"
+
+
+@dataclass(frozen=True)
+class GitUpdateStatus:
+    """The result of comparing this source checkout with its GitHub upstream."""
+
+    behind: int
+    ahead: int
+    dirty: bool
+    current_commit: str
+    available_commit: str
+
+
+@dataclass(frozen=True)
+class WindowsReleaseUpdate:
+    """A newer Windows installer published in the project's GitHub Releases."""
+
+    version: str
+    download_url: str
+    release_name: str
+    sha256: str
+
+
+def semver_key(version: str) -> tuple[int, int, int]:
+    """Return a strict SemVer release tuple, accepting an optional v prefix."""
+    match = re.fullmatch(r"[vV]?(\d+)\.(\d+)\.(\d+)", version.strip())
+    if match is None:
+        raise ValueError(f"Unsupported release version: {version!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def check_for_windows_release_update() -> Optional[WindowsReleaseUpdate]:
+    """Check GitHub Releases for a newer installer asset published by this project."""
+    request = Request(
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+    )
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub returned an invalid release response.")
+    version = str(payload.get("tag_name", "")).lstrip("vV")
+    if semver_key(version) <= semver_key(APP_VERSION):
+        return None
+    for asset in payload.get("assets", []):
+        if asset.get("name") == WINDOWS_INSTALLER_NAME and asset.get("browser_download_url"):
+            digest = str(asset.get("digest") or "")
+            algorithm, separator, sha256 = digest.partition(":")
+            if algorithm != "sha256" or not separator or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+                raise RuntimeError(f"Release {version} does not provide a valid SHA-256 installer digest.")
+            return WindowsReleaseUpdate(
+                version=version,
+                download_url=str(asset["browser_download_url"]),
+                release_name=str(payload.get("name") or f"Version {version}"),
+                sha256=sha256.lower(),
+            )
+    raise RuntimeError(f"Release {version} does not include {WINDOWS_INSTALLER_NAME}.")
+
+
+def download_windows_installer(update: WindowsReleaseUpdate) -> Path:
+    """Download an installer to user settings, never the installed app folder."""
+    updates_dir = settings_directory() / "updates"
+    updates_dir.mkdir(parents=True, exist_ok=True)
+    destination = updates_dir / f"Serial-Protocol-Translator-Setup-{update.version}.exe"
+    descriptor, temporary_path = tempfile.mkstemp(prefix="download-", suffix=".tmp", dir=updates_dir)
+    os.close(descriptor)
+    temporary = Path(temporary_path)
+    try:
+        request = Request(update.download_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        digest = hashlib.sha256()
+        with urlopen(request, timeout=60) as response, temporary.open("wb") as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                digest.update(chunk)
+        with temporary.open("rb") as downloaded:
+            signature = downloaded.read(2)
+        if temporary.stat().st_size < 1024 or signature != b"MZ":
+            raise RuntimeError("The downloaded update is not a valid Windows installer.")
+        if digest.hexdigest() != update.sha256:
+            raise RuntimeError("The downloaded update did not match GitHub's SHA-256 digest.")
+        temporary.replace(destination)
+        return destination
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def launch_windows_installer_after_exit(installer: Path) -> None:
+    """Run the downloaded installer after the frozen GUI has released its files."""
+    if not (is_windows() and getattr(sys, "frozen", False)):
+        raise RuntimeError("Windows installer updates are available only from the installed Windows application.")
+    descriptor, command_path = tempfile.mkstemp(prefix="install-update-", suffix=".cmd", dir=installer.parent)
+    os.close(descriptor)
+    command_file = Path(command_path)
+    executable = Path(sys.executable)
+    command_file.write_text(
+        "@echo off\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+        f'start "" /wait "{installer}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /CLOSEAPPLICATIONS\r\n'
+        "if errorlevel 1 goto cleanup\r\n"
+        f'start "" "{executable}"\r\n'
+        ":cleanup\r\n"
+        "del \"%~f0\"\r\n",
+        encoding="utf-8",
+    )
+    subprocess.Popen(["cmd.exe", "/c", str(command_file)], close_fds=True)
+
+
+def source_repository_directory() -> Optional[Path]:
+    """Return the source checkout containing this application, if there is one."""
+    if getattr(sys, "frozen", False):
+        return None
+    directory = Path(__file__).resolve().parent
+    return directory if (directory / ".git").exists() else None
+
+
+def runtime_dependency_check() -> int:
+    """Import every GUI runtime dependency; used to validate frozen Windows builds."""
+    try:
+        import tkinter  # noqa: F401
+        from tkinter import ttk as _ttk  # noqa: F401
+        import serial as _serial  # noqa: F401
+        import pystray as _pystray  # noqa: F401
+        from PIL import Image as _image, ImageDraw as _image_draw  # noqa: F401
+        if is_windows():
+            import pystray._win32  # noqa: F401
+    except Exception as exc:
+        print(f"Runtime dependency check failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"{APP_NAME} {APP_VERSION}: runtime dependency check passed")
+    return 0
+
+
+def _git_output(repository: Path, *arguments: str) -> str:
+    """Run git in *repository* without a shell and return its standard output."""
+    completed = subprocess.run(
+        ["git", *arguments], cwd=repository, check=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def check_for_git_update(repository: Path) -> GitUpdateStatus:
+    """Fetch origin and report whether the checked-out upstream has new commits."""
+    _git_output(repository, "fetch", "origin", "--prune")
+    current = _git_output(repository, "rev-parse", "--short", "HEAD")
+    available = _git_output(repository, "log", "-1", "--format=%h %s", "@{upstream}")
+    ahead_behind = _git_output(repository, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+    ahead, behind = (int(value) for value in ahead_behind.split())
+    return GitUpdateStatus(
+        behind=behind,
+        ahead=ahead,
+        dirty=bool(_git_output(repository, "status", "--porcelain")),
+        current_commit=current,
+        available_commit=available,
+    )
+
+
+def apply_git_update(repository: Path) -> None:
+    """Fast-forward the current source branch, refusing to overwrite local work."""
+    if _git_output(repository, "status", "--porcelain"):
+        raise RuntimeError("Local changes are present; commit or stash them before updating.")
+    _git_output(repository, "pull", "--ff-only")
 
 
 def session_log_path(log_file: Optional[str], now: Optional[datetime] = None) -> Optional[str]:
@@ -110,9 +283,13 @@ class TrafficLogger:
         self,
         log_file: Optional[str],
         console: bool = True,
+        traffic_mode: str = "full",
         max_log_bytes: int = 5 * 1024 * 1024,
         backup_count: int = 3,
     ) -> None:
+        if traffic_mode not in TRAFFIC_LOG_MODES:
+            raise ValueError(f"traffic mode must be one of: {', '.join(TRAFFIC_LOG_MODES)}")
+        self.traffic_mode = traffic_mode
         self._logger = logging.getLogger("prolab_bridge")
         self._logger.setLevel(logging.INFO)
         self._logger.propagate = False
@@ -161,13 +338,16 @@ class TrafficLogger:
                 handler.close()
 
     def traffic(self, direction: str, data: bytes, note: str = "") -> None:
-        if not data:
+        if not data or self.traffic_mode == "off":
             return
         suffix = f"  [{note}]" if note else ""
-        line = (
-            f"{direction:<9} | HEX: {hex_view(data)} | "
-            f"ASCII: {ascii_view(data)}{suffix}"
-        )
+        if self.traffic_mode == "metadata":
+            line = f"{direction:<9} | {len(data)} byte(s){suffix}"
+        else:
+            line = (
+                f"{direction:<9} | HEX: {hex_view(data)} | "
+                f"ASCII: {ascii_view(data)}{suffix}"
+            )
         with self._lock:
             self._logger.info(line)
 
@@ -178,6 +358,34 @@ class TrafficLogger:
     def error(self, message: str) -> None:
         with self._lock:
             self._logger.error(message)
+
+
+class SessionMetrics:
+    """Thread-safe passive session health counters; never add protocol traffic."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.gw_to_pl_bytes = 0
+        self.pl_to_gw_bytes = 0
+        self.reconnects = 0
+        self.last_activity: Optional[float] = None
+
+    def record(self, direction: str, count: int) -> None:
+        with self._lock:
+            if direction == "gw_to_pl":
+                self.gw_to_pl_bytes += count
+            elif direction == "pl_to_gw":
+                self.pl_to_gw_bytes += count
+            self.last_activity = time.monotonic()
+
+    def reconnected(self) -> None:
+        with self._lock:
+            self.reconnects += 1
+
+    def summary(self) -> str:
+        with self._lock:
+            idle = "no traffic yet" if self.last_activity is None else f"idle {time.monotonic() - self.last_activity:.0f}s"
+            return f"Health: GW→PL {self.gw_to_pl_bytes} B · PL→GW {self.pl_to_gw_bytes} B · reconnects {self.reconnects} · {idle}"
 
 
 class CrLfNormalizer:
@@ -315,6 +523,7 @@ def gw_to_pl_worker(
     cr_wait_s: float,
     error_event: Optional[threading.Event] = None,
     normalize_cr: bool = True,
+    metrics: Optional[SessionMetrics] = None,
 ) -> None:
     normalizer = CrLfNormalizer() if normalize_cr else PassThroughNormalizer()
     pending_since: Optional[float] = None
@@ -336,6 +545,8 @@ def gw_to_pl_worker(
 
                 if output:
                     write_all(pl, output)
+                    if metrics is not None:
+                        metrics.record("gw_to_pl", len(output))
                     traffic_log.traffic(
                         "GW -> PL", output, "CR normalized" if changed else ""
                     )
@@ -348,6 +559,8 @@ def gw_to_pl_worker(
             ):
                 output, changed = normalizer.flush_pending()
                 write_all(pl, output)
+                if metrics is not None:
+                    metrics.record("gw_to_pl", len(output))
                 traffic_log.traffic(
                     "GW -> PL", output, "CR normalized" if changed else ""
                 )
@@ -365,6 +578,8 @@ def gw_to_pl_worker(
             try:
                 output, changed = normalizer.flush_pending()
                 write_all(pl, output)
+                if metrics is not None:
+                    metrics.record("gw_to_pl", len(output))
                 traffic_log.traffic(
                     "GW -> PL", output, "CR normalized during shutdown" if changed else ""
                 )
@@ -378,6 +593,7 @@ def pl_to_gw_worker(
     stop_event: threading.Event,
     traffic_log: TrafficLogger,
     error_event: Optional[threading.Event] = None,
+    metrics: Optional[SessionMetrics] = None,
 ) -> None:
     try:
         while not stop_event.is_set():
@@ -387,6 +603,8 @@ def pl_to_gw_worker(
 
             # Required transparent pass-through: no line-ending/framing changes.
             write_all(gw, data)
+            if metrics is not None:
+                metrics.record("pl_to_gw", len(data))
             traffic_log.traffic("PL -> GW", data)
 
     except (SerialException, OSError) as exc:
@@ -516,6 +734,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Traffic log file; use empty string to disable (default: prolab_translator.log)",
     )
     parser.add_argument(
+        "--traffic-log-mode", choices=TRAFFIC_LOG_MODES, default="full",
+        help="Traffic detail in logs: full, metadata, or off (default: full)",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Disable console traffic logging (file logging can remain enabled)",
@@ -544,7 +766,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     session_log = session_log_path(args.log_file)
-    traffic_log = TrafficLogger(session_log, console=not args.quiet)
+    traffic_log = TrafficLogger(session_log, console=not args.quiet, traffic_mode=args.traffic_log_mode)
 
     gw_settings = PortSettings(
         port=args.gw_port,
@@ -680,6 +902,7 @@ WINDOWS_TEST_PORTS = {
 class PortChoice:
     device: str
     description: str
+    identity: str = ""
 
     @property
     def display(self) -> str:
@@ -716,7 +939,13 @@ def discover_serial_ports(extra_devices: Iterable[str] = ()) -> list[PortChoice]
     for p in list_ports.comports():
         device = str(p.device)
         description = (p.description or "Serial port").strip()
-        found[_device_key(device)] = PortChoice(device, description)
+        serial_number = str(getattr(p, "serial_number", "") or "").strip()
+        vid, pid = getattr(p, "vid", None), getattr(p, "pid", None)
+        location = str(getattr(p, "location", "") or "").strip()
+        identity = f"serial:{serial_number}" if serial_number else ""
+        if not identity and vid is not None and pid is not None and location:
+            identity = f"usb:{vid:04x}:{pid:04x}:{location}"
+        found[_device_key(device)] = PortChoice(device, description, identity)
 
     if is_linux():
         for role, device in LINUX_TEST_ALIASES.items():
@@ -739,6 +968,17 @@ def discover_serial_ports(extra_devices: Iterable[str] = ()) -> list[PortChoice]
 def device_is_available(device: str, ports: Iterable[PortChoice]) -> bool:
     key = _device_key(device.strip())
     return any(_device_key(p.device) == key for p in ports)
+
+
+def device_for_identity(identity: str, ports: Iterable[PortChoice]) -> Optional[str]:
+    """Resolve a saved USB identity to its current OS-assigned port name."""
+    identity = identity.strip()
+    if not identity:
+        return None
+    for port in ports:
+        if port.identity == identity:
+            return port.device
+    return None
 
 
 def preferred_role_device(
@@ -924,6 +1164,31 @@ class QueueLogHandler(logging.Handler):
             self.handleError(record)
 
 
+class Tooltip:
+    """A small hover hint for controls whose serial terminology is unfamiliar."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget, self.text, self.window = widget, text, None
+        widget.bind("<Enter>", self._show, add=True)
+        widget.bind("<Leave>", self._hide, add=True)
+
+    def _show(self, _event: object = None) -> None:
+        if self.window is not None:
+            return
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.window.geometry(f"+{x}+{y}")
+        ttk.Label(self.window, text=self.text, padding=(6, 3), relief="solid").pack()
+
+    def _hide(self, _event: object = None) -> None:
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
 class SerialBridgeController:
     """Run the bridge workers without blocking Tkinter's UI thread."""
 
@@ -948,6 +1213,7 @@ class SerialBridgeController:
         auto_reconnect: bool,
         reconnect_delay_s: float,
         normalize_cr: bool = True,
+        traffic_mode: str = "metadata",
     ) -> None:
         with self._lock:
             if self.running:
@@ -960,7 +1226,7 @@ class SerialBridgeController:
                 name="bridge-supervisor",
                 args=(
                     gw_settings, pl_settings, cr_wait_s, log_file,
-                    auto_reconnect, reconnect_delay_s, normalize_cr,
+                    auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode,
                 ),
                 daemon=True,
             )
@@ -983,13 +1249,15 @@ class SerialBridgeController:
         auto_reconnect: bool,
         reconnect_delay_s: float,
         normalize_cr: bool,
+        traffic_mode: str,
     ) -> None:
         queue_handler: Optional[QueueLogHandler] = None
         traffic_log: Optional[TrafficLogger] = None
         terminal_error = False
+        metrics = SessionMetrics()
 
         try:
-            traffic_log = TrafficLogger(log_file, console=False)
+            traffic_log = TrafficLogger(log_file, console=False, traffic_mode=traffic_mode)
             queue_handler = QueueLogHandler(self.event_queue)
             queue_handler.setFormatter(
                 logging.Formatter(
@@ -1025,6 +1293,7 @@ class SerialBridgeController:
                 session_failed = False
                 try:
                     if attempt:
+                        metrics.reconnected()
                         message = f"Reconnecting (attempt {attempt})..."
                         traffic_log.info(message)
                         self.event_queue.put(("state", f"reconnecting|{message}"))
@@ -1035,20 +1304,24 @@ class SerialBridgeController:
                     t_gw_pl = threading.Thread(
                         target=gw_to_pl_worker,
                         name="gw-to-pl",
-                        args=(gw, pl, session_stop, traffic_log, cr_wait_s, None, normalize_cr),
+                        args=(gw, pl, session_stop, traffic_log, cr_wait_s, None, normalize_cr, metrics),
                         daemon=True,
                     )
                     t_pl_gw = threading.Thread(
                         target=pl_to_gw_worker,
                         name="pl-to-gw",
-                        args=(pl, gw, session_stop, traffic_log),
+                        args=(pl, gw, session_stop, traffic_log, None, metrics),
                         daemon=True,
                     )
                     t_gw_pl.start()
                     t_pl_gw.start()
                     traffic_log.info("Bridge running.")
                     self.event_queue.put(("state", "running|Bridge running"))
+                    last_metrics_report = 0.0
                     while not self.stop_event.wait(0.20):
+                        if time.monotonic() - last_metrics_report >= 1.0:
+                            self.event_queue.put(("metrics", metrics.summary()))
+                            last_metrics_report = time.monotonic()
                         if session_stop.is_set() or not t_gw_pl.is_alive() or not t_pl_gw.is_alive():
                             session_failed = True
                             session_stop.set()
@@ -1111,7 +1384,7 @@ class ProLabTranslatorGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("860x600")
+        self.root.geometry("900x640")
         self.root.minsize(720, 500)
 
         self.event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -1119,6 +1392,9 @@ class ProLabTranslatorGUI:
         self.test_bench: Optional[LinuxVirtualTestBench] = None
         self.test_clients: list[BaseTestClient] = []
         self.port_display_to_device: dict[str, str] = {}
+        self.port_device_to_identity: dict[str, str] = {}
+        self._update_check_in_progress = False
+        self.last_error = ""
         self.saved_settings = load_settings("translator_gui")
         self.profiles = load_settings("translator_profiles")
 
@@ -1134,9 +1410,12 @@ class ProLabTranslatorGUI:
     def _make_variables(self) -> None:
         saved = self.saved_settings
         self.gw_port_var = tk.StringVar(value=str(saved.get("gw_port", "")))
+        self.gw_port_identity = str(saved.get("gw_port_identity", ""))
         self.template_var = tk.StringVar(value=str(saved.get("template", "Generic bidirectional")))
         self.profile_var = tk.StringVar()
         self.pl_port_var = tk.StringVar(value=str(saved.get("pl_port", "")))
+        self.pl_port_identity = str(saved.get("pl_port_identity", ""))
+        self.connection_summary_var = tk.StringVar(value="Configure the bridge before starting a session")
         self.gw_baud_var = tk.StringVar(value=str(saved.get("gw_baud", "9600")))
         self.pl_baud_var = tk.StringVar(value=str(saved.get("pl_baud", "9600")))
         # Fall back to the pre-per-port settings so existing installations keep
@@ -1163,7 +1442,21 @@ class ProLabTranslatorGUI:
         self.log_file_var = tk.StringVar(
             value=str(saved.get("log_file") or default_log_file)
         )
+        self.traffic_log_mode_var = tk.StringVar(value=str(saved.get("traffic_log_mode", "metadata")))
         self.status_var = tk.StringVar(value="Stopped")
+        self.last_traffic_var = tk.StringVar(value="Last traffic: none yet")
+        self.session_health_var = tk.StringVar(value="Health: bridge stopped")
+        self.last_update_check_var = tk.StringVar(value="Updates not checked")
+        self.compact_mode_var = tk.BooleanVar(value=bool(saved.get("compact_mode", False)))
+        self.activity_filter_var = tk.StringVar(value="")
+        self.pause_follow_var = tk.BooleanVar(value=False)
+        self.auto_scroll_var = tk.BooleanVar(value=bool(saved.get("auto_scroll", True)))
+        self.activity_line_limit_var = tk.StringVar(value=str(saved.get("activity_line_limit", "2000")))
+        self.confirm_stop_var = tk.BooleanVar(value=bool(saved.get("confirm_stop", True)))
+        self.activity_font_size_var = tk.StringVar(value=str(saved.get("activity_font_size", "9")))
+        self.gw_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
+        self.pl_port_var.trace_add("write", lambda *_args: self._refresh_connection_summary())
+        self.status_var.trace_add("write", lambda *_args: self._update_status_appearance())
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -1179,16 +1472,17 @@ class ProLabTranslatorGUI:
         )
         title.grid(row=0, column=0, sticky="w")
 
+        ttk.Label(outer, textvariable=self.last_traffic_var).grid(row=0, column=0, sticky="e")
+
         topology = ttk.Label(
             outer,
-            text=(
-                "Bidirectional serial bridge. Choose a template or save a reusable profile."
-            ),
+            textvariable=self.connection_summary_var,
         )
         topology.grid(row=1, column=0, sticky="w", pady=(1, 6))
 
-        ports_frame = ttk.LabelFrame(outer, text="Serial ports", padding=6)
+        ports_frame = ttk.LabelFrame(outer, text="Session setup: serial ports", padding=6)
         ports_frame.grid(row=2, column=0, sticky="ew")
+        self.ports_frame = ports_frame
         ports_frame.columnconfigure(1, weight=1)
         ports_frame.columnconfigure(3, weight=1)
 
@@ -1236,9 +1530,14 @@ class ProLabTranslatorGUI:
             ports_frame, text="Refresh ports", command=self.refresh_ports
         )
         self.refresh_button.grid(row=0, column=4, rowspan=2, padx=(12, 0), sticky="ns")
+        self.recommended_defaults_button = ttk.Button(
+            ports_frame, text="Recommended defaults", command=self.restore_recommended_defaults
+        )
+        self.recommended_defaults_button.grid(row=2, column=0, columnspan=5, sticky="w", pady=(4, 0))
 
-        settings_frame = ttk.LabelFrame(outer, text="Serial / translator settings", padding=6)
+        settings_frame = ttk.LabelFrame(outer, text="Session setup: serial / translator settings", padding=6)
         settings_frame.grid(row=3, column=0, sticky="ew", pady=(6, 6))
+        self.settings_frame = settings_frame
 
         settings_frame.columnconfigure(1, weight=1)
         settings_frame.columnconfigure(2, weight=1)
@@ -1295,11 +1594,33 @@ class ProLabTranslatorGUI:
         self.log_entry.grid(row=0, column=1, sticky="ew")
         self.browse_button = ttk.Button(log_frame, text="Browse...", command=self.choose_log_file)
         self.browse_button.grid(row=0, column=2, padx=(6, 0))
+        self.open_log_folder_button = ttk.Button(log_frame, text="Open folder", command=self.open_log_folder)
+        self.open_log_folder_button.grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(log_frame, text="Traffic detail").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.traffic_log_mode_combo = ttk.Combobox(
+            log_frame, textvariable=self.traffic_log_mode_var, values=TRAFFIC_LOG_MODES,
+            state="readonly", width=12,
+        )
+        self.traffic_log_mode_combo.grid(row=1, column=1, sticky="w", pady=(5, 0))
+        ttk.Label(log_frame, text="Metadata avoids recording instrument/sample payloads.").grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=(6, 0), pady=(5, 0)
+        )
 
         traffic_frame = ttk.LabelFrame(outer, text="Live traffic", padding=6)
         traffic_frame.grid(row=4, column=0, sticky="nsew")
         traffic_frame.columnconfigure(0, weight=1)
-        traffic_frame.rowconfigure(0, weight=1)
+        traffic_frame.rowconfigure(1, weight=1)
+
+        activity_tools = ttk.Frame(traffic_frame)
+        activity_tools.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        activity_tools.columnconfigure(1, weight=1)
+        ttk.Label(activity_tools, text="Filter").grid(row=0, column=0, padx=(0, 4))
+        self.activity_filter_entry = ttk.Entry(activity_tools, textvariable=self.activity_filter_var)
+        self.activity_filter_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(activity_tools, text="Copy", command=self.copy_traffic).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(activity_tools, text="Clear", command=self.clear_traffic).grid(row=0, column=3, padx=(4, 0))
+        self.pause_follow_check = ttk.Checkbutton(activity_tools, text="Pause follow", variable=self.pause_follow_var)
+        self.pause_follow_check.grid(row=0, column=4, padx=(8, 0))
 
         self.traffic_text = tk.Text(
             traffic_frame,
@@ -1308,12 +1629,12 @@ class ProLabTranslatorGUI:
             height=12,
             state="disabled",
         )
-        self.traffic_text.grid(row=0, column=0, sticky="nsew")
+        self.traffic_text.grid(row=1, column=0, sticky="nsew")
 
         yscroll = ttk.Scrollbar(traffic_frame, orient="vertical", command=self.traffic_text.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
+        yscroll.grid(row=1, column=1, sticky="ns")
         xscroll = ttk.Scrollbar(traffic_frame, orient="horizontal", command=self.traffic_text.xview)
-        xscroll.grid(row=1, column=0, sticky="ew")
+        xscroll.grid(row=2, column=0, sticky="ew")
         self.traffic_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
 
         controls = ttk.Frame(outer)
@@ -1326,27 +1647,28 @@ class ProLabTranslatorGUI:
         self.stop_button = ttk.Button(controls, text="Stop Bridge", command=self.stop_bridge)
         self.stop_button.grid(row=0, column=1, padx=(0, 6))
 
+        self.setup_button = ttk.Button(controls, text="Session Setup", command=self.toggle_session_setup)
+        self.setup_button.grid(row=0, column=2)
+
         self.clear_button = ttk.Button(controls, text="Clear Traffic", command=self.clear_traffic)
-        self.clear_button.grid(row=0, column=2)
+        self.clear_button.grid(row=0, column=3, padx=(6, 0))
 
         self.simulate_button = ttk.Button(
             controls, text="Simulate Traffic", command=self.simulate_traffic
         )
-        self.simulate_button.grid(row=0, column=3, padx=(6, 0))
+        self.simulate_button.grid(row=0, column=4, padx=(6, 0))
 
         self.console_button = ttk.Button(controls, text="Serial Console", command=self.open_serial_console)
-        self.console_button.grid(row=0, column=4, padx=(6, 0))
+        self.console_button.grid(row=0, column=5, padx=(6, 0))
 
-        self.startup_button = ttk.Button(controls, command=self.toggle_windows_startup)
-        self.startup_button.grid(row=0, column=5, padx=(6, 0))
-        self._refresh_startup_button()
-
-        self.minimized_check = ttk.Checkbutton(controls, text="Start minimized", variable=self.start_minimized_var)
-        self.minimized_check.grid(row=0, column=6, padx=(6, 0))
+        self.update_button = ttk.Button(controls, text="Check for Updates", command=self.check_for_updates)
+        self.update_button.grid(row=0, column=6, padx=(6, 0))
+        ttk.Label(controls, textvariable=self.last_update_check_var).grid(row=1, column=6, columnspan=2, sticky="e")
+        ttk.Label(controls, textvariable=self.session_health_var).grid(row=1, column=0, columnspan=6, sticky="w")
 
         ttk.Label(controls, text="Status:").grid(row=0, column=7, padx=(12, 4))
         self.status_label = ttk.Label(
-            controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold")
+            controls, textvariable=self.status_var, font=("Segoe UI", 9, "bold"), style="Status.stopped.TLabel"
         )
         self.status_label.grid(row=0, column=8, sticky="e")
 
@@ -1366,11 +1688,34 @@ class ProLabTranslatorGUI:
             self.gw_dsrdtr_check, self.pl_dsrdtr_check,
             self.auto_reconnect_check,
             self.reconnect_delay_entry,
-            self.minimized_check,
             self.log_entry,
+            self.traffic_log_mode_combo,
             self.browse_button,
             self.refresh_button,
+            self.recommended_defaults_button,
         ]
+        self.session_setup_visible = not self.compact_mode_var.get()
+        if not self.session_setup_visible:
+            self.ports_frame.grid_remove()
+            self.settings_frame.grid_remove()
+        self.setup_button.configure(text="Session Setup" if not self.session_setup_visible else "Hide Setup")
+        self._configure_status_styles()
+        self._update_status_appearance()
+        self._bind_shortcuts()
+        for widget, text in (
+            (self.gw_port_combo, "Port connected to the GasWorks application."),
+            (self.pl_port_combo, "Port connected to the physical ProLab analyzer."),
+            (self.gw_parity_combo, "Parity adds an optional error-checking bit. Most instruments use N (none)."),
+            (self.pl_parity_combo, "Parity must match the ProLab serial configuration."),
+            (self.cr_wait_entry, "Wait briefly after CR so an incoming LF is not duplicated."),
+            (self.read_timeout_entry, "How long each serial read waits before checking again."),
+            (self.write_timeout_entry, "Maximum time allowed for a serial write."),
+            (self.gw_xonxoff_check, "Software flow control. Enable only if this device requires it."),
+            (self.pl_xonxoff_check, "Software flow control. Enable only if this device requires it."),
+            (self.gw_rtscts_check, "Hardware RTS/CTS flow control. Enable only if wired and required."),
+            (self.pl_rtscts_check, "Hardware RTS/CTS flow control. Enable only if wired and required."),
+        ):
+            Tooltip(widget, text)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self.root)
@@ -1396,30 +1741,365 @@ class ProLabTranslatorGUI:
         view_menu.add_command(label="Refresh Ports", command=self.refresh_ports)
         view_menu.add_command(label="Serial Console…", command=self.open_serial_console)
         view_menu.add_command(label="View Log Files…", command=self.view_log_files)
+        view_menu.add_checkbutton(label="Compact mode", variable=self.compact_mode_var, command=self.set_compact_mode)
         menu.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu, tearoff=False)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", APP_NAME, parent=self.root))
+        help_menu.add_command(label="Check for Updates…", command=self.check_for_updates)
+        help_menu.add_command(
+            label="About",
+            command=lambda: messagebox.showinfo(
+                "About", f"{APP_NAME}\nVersion {APP_VERSION}", parent=self.root
+            ),
+        )
         menu.add_cascade(label="Help", menu=help_menu)
         self.root.configure(menu=menu)
+
+    def _configure_status_styles(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("Status.running.TLabel", foreground="#187a3a")
+        style.configure("Status.connecting.TLabel", foreground="#9a6200")
+        style.configure("Status.reconnecting.TLabel", foreground="#9a6200")
+        style.configure("Status.error.TLabel", foreground="#a51d2d")
+        style.configure("Status.stopped.TLabel", foreground="#555555")
+        style.configure("Invalid.TEntry", fieldbackground="#ffe8e8")
+        style.configure("Invalid.TCombobox", fieldbackground="#ffe8e8")
+
+    def _update_status_appearance(self) -> None:
+        status = self.status_var.get().casefold()
+        if "error" in status or "failed" in status:
+            state = "error"
+        elif "reconnect" in status:
+            state = "reconnecting"
+        elif "start" in status or "check" in status or "updat" in status:
+            state = "connecting"
+        elif "running" in status:
+            state = "running"
+        else:
+            state = "stopped"
+        if hasattr(self, "status_label"):
+            self.status_label.configure(style=f"Status.{state}.TLabel")
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind_all("<Control-r>", lambda _event: (self.refresh_ports(), "break")[1])
+        self.root.bind_all("<Control-l>", lambda _event: (self.clear_traffic(), "break")[1])
+        self.root.bind_all("<Control-s>", lambda _event: (self.toggle_bridge_shortcut(), "break")[1])
+
+    def toggle_bridge_shortcut(self) -> None:
+        if self.controller.running:
+            self.stop_bridge()
+        else:
+            self.start_bridge()
+
+    def set_compact_mode(self) -> None:
+        desired_visible = not self.compact_mode_var.get()
+        if desired_visible != self.session_setup_visible:
+            self.toggle_session_setup(save=False)
+        self._save_settings()
+
+    def restore_recommended_defaults(self) -> None:
+        """Apply the documented GasWorks COM5/COM6 to ProLab COM4 topology."""
+        self.gw_port_var.set("COM6")
+        self.pl_port_var.set("COM4")
+        self.template_var.set("GasWorks ↔ ProLab")
+        for variable, value in (
+            (self.gw_baud_var, "9600"), (self.pl_baud_var, "9600"),
+            (self.gw_bytesize_var, "8"), (self.pl_bytesize_var, "8"),
+            (self.gw_parity_var, "N"), (self.pl_parity_var, "N"),
+            (self.gw_stopbits_var, "1"), (self.pl_stopbits_var, "1"),
+            (self.read_timeout_var, "10"), (self.cr_wait_var, "20"),
+            (self.write_timeout_var, "2.0"), (self.reconnect_delay_var, "3"),
+        ):
+            variable.set(value)
+        for variable in (self.gw_xonxoff_var, self.pl_xonxoff_var, self.gw_rtscts_var,
+                         self.pl_rtscts_var, self.gw_dsrdtr_var, self.pl_dsrdtr_var):
+            variable.set(False)
+        self.auto_reconnect_var.set(True)
+        self.refresh_ports()
+        self.status_var.set("Recommended defaults applied")
+
+    def open_log_folder(self) -> None:
+        directory = Path(self.log_file_var.get().strip() or settings_directory()).expanduser().parent
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            webbrowser.open(directory.resolve().as_uri())
+        except OSError as exc:
+            self.show_error("Open Log Folder", str(exc))
+
+    def check_for_updates(self) -> None:
+        """Check GitHub in a worker, leaving the Tkinter event loop responsive."""
+        if self._update_check_in_progress:
+            return
+        repository = source_repository_directory()
+        if repository is None:
+            if is_windows() and getattr(sys, "frozen", False):
+                self._check_windows_release_updates()
+                return
+            messagebox.showinfo(
+                "Check for Updates",
+                "This installed application is not a Git source checkout. "
+                "Install a newer release to update it.",
+                parent=self.root,
+            )
+            return
+
+        self._update_check_in_progress = True
+        self.status_var.set("Checking GitHub for updates...")
+
+        def worker() -> None:
+            try:
+                result = check_for_git_update(repository)
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_check_error(error))
+            else:
+                self.root.after(0, lambda: self._finish_update_check(result, repository))
+
+        threading.Thread(target=worker, name="check-for-updates", daemon=True).start()
+
+    def _check_windows_release_updates(self) -> None:
+        """Check GitHub Releases for a newer installer without blocking Tkinter."""
+        self._update_check_in_progress = True
+        self.status_var.set("Checking GitHub Releases for updates...")
+
+        def worker() -> None:
+            try:
+                update = check_for_windows_release_update()
+            except (OSError, URLError, ValueError, RuntimeError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_check_error(error))
+            else:
+                self.root.after(0, lambda: self._finish_windows_release_check(update))
+
+        threading.Thread(target=worker, name="check-windows-release-updates", daemon=True).start()
+
+    def _finish_windows_release_check(self, update: Optional[WindowsReleaseUpdate]) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last checked: {datetime.now().strftime('%H:%M:%S')}")
+        if update is None:
+            self.status_var.set("Up to date")
+            messagebox.showinfo(
+                "Check for Updates",
+                f"You already have the latest version ({APP_VERSION}).",
+                parent=self.root,
+            )
+            return
+        if self.controller.running:
+            self.status_var.set("Update available")
+            messagebox.showinfo(
+                "Update Available",
+                f"Version {update.version} is available. Stop the serial bridge, then check again to update safely.",
+                parent=self.root,
+            )
+            return
+        if messagebox.askyesno(
+            "Update Available",
+            f"{update.release_name} (version {update.version}) is available.\n\n"
+            "Download, install, and restart now?",
+            parent=self.root,
+        ):
+            self._download_windows_update(update)
+        else:
+            self.status_var.set("Update available")
+
+    def _download_windows_update(self, update: WindowsReleaseUpdate) -> None:
+        self._update_check_in_progress = True
+        self.status_var.set(f"Downloading version {update.version}...")
+
+        def worker() -> None:
+            try:
+                installer = download_windows_installer(update)
+            except (OSError, URLError, RuntimeError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_error(error))
+            else:
+                self.root.after(0, lambda: self._install_windows_update(installer, update.version))
+
+        threading.Thread(target=worker, name="download-windows-update", daemon=True).start()
+
+    def _install_windows_update(self, installer: Path, version: str) -> None:
+        try:
+            launch_windows_installer_after_exit(installer)
+        except (OSError, RuntimeError) as exc:
+            self._finish_update_error(exc)
+            return
+        self._update_check_in_progress = False
+        self.status_var.set(f"Installing version {version}...")
+        self._save_settings()
+        self.on_close()
+
+    def _finish_update_check_error(self, error: Exception) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last check failed: {datetime.now().strftime('%H:%M:%S')}")
+        self.status_var.set("Update check failed")
+        self.show_error("Check for Updates", f"Could not check the GitHub repository.\n\n{error}")
+
+    def _finish_update_check(self, result: GitUpdateStatus, repository: Path) -> None:
+        self._update_check_in_progress = False
+        self.last_update_check_var.set(f"Last checked: {datetime.now().strftime('%H:%M:%S')}")
+        if not result.behind:
+            self.status_var.set("Up to date")
+            extra = f"\n\nThis checkout also has {result.ahead} local commit(s) not on GitHub." if result.ahead else ""
+            messagebox.showinfo(
+                "Check for Updates",
+                f"You already have the latest version ({APP_VERSION}; commit {result.current_commit}).{extra}",
+                parent=self.root,
+            )
+            return
+        if result.dirty:
+            self.status_var.set("Update available")
+            messagebox.showwarning(
+                "Update Available",
+                f"GitHub has {result.behind} newer commit(s) ({result.available_commit}), "
+                "but this checkout has local changes. Commit or stash them before updating.",
+                parent=self.root,
+            )
+            return
+        if self.controller.running:
+            self.status_var.set("Update available")
+            messagebox.showinfo(
+                "Update Available",
+                f"GitHub has {result.behind} newer commit(s) ({result.available_commit}). "
+                "Stop the serial bridge, then check again to update safely.",
+                parent=self.root,
+            )
+            return
+        if messagebox.askyesno(
+            "Update Available",
+            f"GitHub has {result.behind} newer commit(s):\n{result.available_commit}\n\n"
+            "Update this checkout now? The application will restart after a successful update.",
+            parent=self.root,
+        ):
+            self._apply_update(repository)
+        else:
+            self.status_var.set("Update available")
+
+    def _apply_update(self, repository: Path) -> None:
+        self._update_check_in_progress = True
+        self.status_var.set("Updating from GitHub...")
+
+        def worker() -> None:
+            try:
+                apply_git_update(repository)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.root.after(0, lambda error=exc: self._finish_update_error(error))
+            else:
+                self.root.after(0, lambda: self._restart_after_update(repository))
+
+        threading.Thread(target=worker, name="apply-update", daemon=True).start()
+
+    def _finish_update_error(self, error: Exception) -> None:
+        self._update_check_in_progress = False
+        self.status_var.set("Update failed")
+        self.show_error("Update Failed", f"Could not update from GitHub.\n\n{error}")
+
+    def _restart_after_update(self, repository: Path) -> None:
+        command = [sys.executable, str(Path(__file__).resolve()), "--gui"]
+        try:
+            subprocess.Popen(command, cwd=repository)
+        except OSError as exc:
+            self._finish_update_error(exc)
+            return
+        self._save_settings()
+        self.on_close()
 
     def open_serial_console(self) -> None:
         """Open a separate, raw serial terminal for an available device."""
         SerialConsole(self.root)
 
+    def toggle_session_setup(self, save: bool = True) -> None:
+        """Keep the dashboard activity-first while retaining quick setup access."""
+        if self.session_setup_visible:
+            self.ports_frame.grid_remove()
+            self.settings_frame.grid_remove()
+            self.session_setup_visible = False
+            self.setup_button.configure(text="Session Setup")
+        else:
+            self.ports_frame.grid()
+            self.settings_frame.grid()
+            self.session_setup_visible = True
+            self.setup_button.configure(text="Hide Setup")
+        self.compact_mode_var.set(not self.session_setup_visible)
+        if save:
+            self._save_settings()
+
+    def show_error(self, title: str, detail: str) -> None:
+        """Show an actionable error dialog with support-ready copy text."""
+        self.last_error = f"{title}\n\n{detail}"
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        outer = ttk.Frame(dialog, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=detail, justify="left", wraplength=520).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        def copy_details() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.last_error)
+
+        ttk.Button(outer, text="Copy error details", command=copy_details).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(outer, text="Close", command=dialog.destroy).grid(row=1, column=1, sticky="e", pady=(12, 0))
+        dialog.grab_set()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+
     def open_preferences(self) -> None:
         window = tk.Toplevel(self.root)
         window.title("Preferences")
-        outer = ttk.Frame(window, padding=10)
+        window.geometry("620x460")
+        window.minsize(540, 380)
+        outer = ttk.Frame(window, padding=8)
         outer.pack(fill="both", expand=True)
-        ttk.Checkbutton(outer, text="Start minimized", variable=self.start_minimized_var).grid(row=0, column=0, sticky="w")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        notebook = ttk.Notebook(outer)
+        notebook.grid(row=0, column=0, sticky="nsew")
+
+        behavior = ttk.Frame(notebook, padding=10)
+        activity = ttk.Frame(notebook, padding=10)
+        serial_defaults = ttk.Frame(notebook, padding=10)
+        diagnostics = ttk.Frame(notebook, padding=10)
+        notebook.add(behavior, text="Behavior")
+        notebook.add(serial_defaults, text="Serial defaults")
+        notebook.add(activity, text="Activity")
+        notebook.add(diagnostics, text="Safety & diagnostics")
+
+        ttk.Checkbutton(behavior, text="Start minimized", variable=self.start_minimized_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(behavior, text="Auto reconnect by default", variable=self.auto_reconnect_var).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(behavior, text="Retry delay (seconds)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(behavior, textvariable=self.reconnect_delay_var, width=10).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(8, 0))
         if is_windows():
-            button = ttk.Button(outer, command=self.toggle_windows_startup)
-            button.grid(row=1, column=0, sticky="w", pady=(8, 0))
-            button.configure(text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in")
+            self.preference_startup_button = ttk.Button(behavior, command=self.toggle_windows_startup)
+            self.preference_startup_button.grid(row=3, column=0, sticky="w", pady=(12, 0))
+            self._refresh_startup_button()
         else:
-            ttk.Label(outer, text="Start at sign-in is available on Windows only.").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(outer, text="Hide window to tray", command=self.root.withdraw).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(outer, text="Close", command=lambda: (self._save_settings(), window.destroy())).grid(row=3, column=0, sticky="e", pady=(12, 0))
+            ttk.Label(behavior, text="Start at sign-in is available on Windows only.").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(behavior, text="Hide window to tray", command=self.root.withdraw).grid(row=4, column=0, sticky="w", pady=(12, 0))
+
+        ttk.Label(serial_defaults, text="Per-session port and serial settings are available from Session Setup.").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(serial_defaults, text="Default bridge template").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Combobox(serial_defaults, textvariable=self.template_var, values=tuple(TEMPLATES), state="readonly", width=24).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
+        ttk.Label(serial_defaults, text="Read timeout (ms)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.read_timeout_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(serial_defaults, text="Write timeout (s)").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.write_timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(serial_defaults, text="CR wait (ms)").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(serial_defaults, textvariable=self.cr_wait_var, width=10).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Checkbutton(activity, text="Follow new traffic automatically", variable=self.auto_scroll_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(activity, text="Activity font size").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        font_size = ttk.Spinbox(activity, from_=7, to=18, textvariable=self.activity_font_size_var, width=6, command=self.apply_activity_preferences)
+        font_size.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(activity, text="Maximum visible lines").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(activity, textvariable=self.activity_line_limit_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(activity, text="Use the dashboard Filter field to show matching activity as it arrives.").grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Checkbutton(diagnostics, text="Confirm before stopping an active bridge", variable=self.confirm_stop_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(diagnostics, text="Diagnostic logs rotate at 5 MiB and retain three backups.").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(diagnostics, text="Log file").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(diagnostics, textvariable=self.log_file_var, width=52).grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        ttk.Button(diagnostics, text="Choose…", command=self.choose_log_file).grid(row=3, column=1, padx=(6, 0), pady=(3, 0))
+
+        bottom = ttk.Frame(outer)
+        bottom.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(bottom, text="Apply", command=lambda: (self.apply_activity_preferences(), self._save_settings())).pack(side="right")
+        ttk.Button(bottom, text="Close", command=lambda: (self.apply_activity_preferences(), self._save_settings(), window.destroy())).pack(side="right", padx=(0, 6))
 
     def view_log_files(self) -> None:
         """Show available session logs without exposing them for modification."""
@@ -1478,6 +2158,10 @@ class ProLabTranslatorGUI:
         current_pl = self._device_from_combo_text(self.pl_port_var.get())
 
         ports = discover_serial_ports((current_gw, current_pl))
+        if not device_is_available(current_gw, ports):
+            current_gw = device_for_identity(self.gw_port_identity, ports) or current_gw
+        if not device_is_available(current_pl, ports):
+            current_pl = device_for_identity(self.pl_port_identity, ports) or current_pl
         if not current_gw and not current_pl:
             current_gw, current_pl = translator_default_devices(ports)
 
@@ -1489,6 +2173,7 @@ class ProLabTranslatorGUI:
             mapping[display] = port.device
 
         self.port_display_to_device = mapping
+        self.port_device_to_identity = {port.device: port.identity for port in ports}
         self.gw_port_combo["values"] = displays
         self.pl_port_combo["values"] = displays
 
@@ -1500,16 +2185,26 @@ class ProLabTranslatorGUI:
 
         self.gw_port_var.set(choose_display(current_gw or "COM6"))
         self.pl_port_var.set(choose_display(current_pl or "COM4"))
+        self._remember_current_port_identities()
+        self._refresh_connection_summary()
         self._append_log(f"Detected {len(displays)} serial port(s).")
+
+    def _refresh_connection_summary(self) -> None:
+        gw = self._device_from_combo_text(self.gw_port_var.get()) or "Source port not selected"
+        pl = self._device_from_combo_text(self.pl_port_var.get()) or "Destination port not selected"
+        self.connection_summary_var.set(f"Session route: {gw}  →  {pl}")
 
     def _save_settings(self) -> None:
         """Persist UI choices without making serial operation depend on disk I/O."""
+        self._remember_current_port_identities()
         save_settings(
             "translator_gui",
             {
                 "gw_port": self._device_from_combo_text(self.gw_port_var.get()),
+                "gw_port_identity": self.gw_port_identity,
                 "template": self.template_var.get(),
                 "pl_port": self._device_from_combo_text(self.pl_port_var.get()),
+                "pl_port_identity": self.pl_port_identity,
                 "gw_baud": self.gw_baud_var.get(),
                 "pl_baud": self.pl_baud_var.get(),
                 "gw_bytesize": self.gw_bytesize_var.get(),
@@ -1531,8 +2226,37 @@ class ProLabTranslatorGUI:
                 "reconnect_delay_s": self.reconnect_delay_var.get(),
                 "start_minimized": self.start_minimized_var.get(),
                 "log_file": self.log_file_var.get(),
+                "traffic_log_mode": self.traffic_log_mode_var.get(),
+                "auto_scroll": self.auto_scroll_var.get(),
+                "activity_line_limit": self.activity_line_limit_var.get(),
+                "activity_font_size": self.activity_font_size_var.get(),
+                "confirm_stop": self.confirm_stop_var.get(),
+                "compact_mode": self.compact_mode_var.get(),
             },
         )
+
+    def _remember_current_port_identities(self) -> None:
+        """Keep the preferred hardware identity in sync with a user port selection."""
+        gw_device = self._device_from_combo_text(self.gw_port_var.get())
+        pl_device = self._device_from_combo_text(self.pl_port_var.get())
+        if gw_device in self.port_device_to_identity:
+            self.gw_port_identity = self.port_device_to_identity[gw_device]
+        if pl_device in self.port_device_to_identity:
+            self.pl_port_identity = self.port_device_to_identity[pl_device]
+
+    def apply_activity_preferences(self) -> None:
+        """Apply display-only settings without interrupting the bridge."""
+        try:
+            size = int(self.activity_font_size_var.get())
+            line_limit = int(self.activity_line_limit_var.get())
+            if not 7 <= size <= 18:
+                raise ValueError("Activity font size must be between 7 and 18")
+            if line_limit < 100:
+                raise ValueError("Maximum visible lines must be at least 100")
+        except ValueError as exc:
+            messagebox.showerror("Activity preferences", str(exc), parent=self.root)
+            return
+        self.traffic_text.configure(font=("Consolas", size))
 
     def save_profile(self) -> None:
         name = simpledialog.askstring("Save profile", "Profile name:", parent=self.root)
@@ -1552,6 +2276,8 @@ class ProLabTranslatorGUI:
         for key, variable in (("gw_port", self.gw_port_var), ("pl_port", self.pl_port_var), ("template", self.template_var), ("gw_baud", self.gw_baud_var), ("pl_baud", self.pl_baud_var)):
             if key in profile:
                 variable.set(str(profile[key]))
+        self.gw_port_identity = str(profile.get("gw_port_identity", ""))
+        self.pl_port_identity = str(profile.get("pl_port_identity", ""))
         self.refresh_ports()
 
     def choose_log_file(self) -> None:
@@ -1577,6 +2303,39 @@ class ProLabTranslatorGUI:
         if value not in mapping:
             raise ValueError("Stop bits must be 1, 1.5, or 2")
         return mapping[value]
+
+    def _clear_validation(self) -> None:
+        for widget in getattr(self, "_validation_widgets", []):
+            try:
+                if isinstance(widget, ttk.Combobox):
+                    widget.configure(style="TCombobox")
+                else:
+                    widget.configure(style="TEntry")
+            except tk.TclError:
+                pass
+
+    def _mark_invalid_settings(self, message: str) -> None:
+        """Highlight the most likely field(s) when pre-start validation fails."""
+        self._clear_validation()
+        candidates: list[tk.Widget] = []
+        lower = message.casefold()
+        if "both" in lower or "different" in lower:
+            candidates = [self.gw_port_combo, self.pl_port_combo]
+        elif "baud" in lower:
+            candidates = [self.gw_baud_combo, self.pl_baud_combo]
+        elif "stop bits" in lower:
+            candidates = [self.gw_stopbits_combo, self.pl_stopbits_combo]
+        elif "write timeout" in lower:
+            candidates = [self.write_timeout_entry]
+        elif "timeout" in lower:
+            candidates = [self.read_timeout_entry, self.cr_wait_entry]
+        elif "reconnect" in lower:
+            candidates = [self.reconnect_delay_entry]
+        self._validation_widgets = candidates
+        for widget in candidates:
+            widget.configure(style="Invalid.TCombobox" if isinstance(widget, ttk.Combobox) else "Invalid.TEntry")
+        if candidates:
+            candidates[0].focus_set()
 
     def _build_settings(self) -> tuple[PortSettings, PortSettings, float, Optional[str]]:
         gw_port = self._device_from_combo_text(self.gw_port_var.get())
@@ -1627,35 +2386,46 @@ class ProLabTranslatorGUI:
             dsrdtr=self.pl_dsrdtr_var.get(), **common,
         )
         log_file = session_log_path(self.log_file_var.get().strip() or None)
-        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False)
+        traffic_mode = self.traffic_log_mode_var.get()
+        if traffic_mode not in TRAFFIC_LOG_MODES:
+            raise ValueError("Select a valid traffic detail mode")
+        return gw_settings, pl_settings, cr_wait_ms / 1000.0, log_file, self.auto_reconnect_var.get(), reconnect_delay_s, TEMPLATES.get(self.template_var.get(), False), traffic_mode
 
     def start_bridge(self) -> None:
+        self._clear_validation()
         try:
-            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr = self._build_settings()
+            gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode = self._build_settings()
         except (ValueError, TypeError) as exc:
-            messagebox.showerror("Invalid settings", str(exc), parent=self.root)
+            self._mark_invalid_settings(str(exc))
+            self.show_error("Invalid settings", str(exc))
             return
 
         self.status_var.set("Starting...")
         self._set_running_ui(True)
         try:
-            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr)
+            self.controller.start(gw_settings, pl_settings, cr_wait_s, log_file, auto_reconnect, reconnect_delay_s, normalize_cr, traffic_mode)
             self._save_settings()
         except Exception as exc:
             self._set_running_ui(False)
             self.status_var.set("Stopped")
-            messagebox.showerror("Could not start bridge", str(exc), parent=self.root)
+            self.show_error("Could not start bridge", str(exc))
 
     def stop_bridge(self) -> None:
+        if self.confirm_stop_var.get() and self.controller.running:
+            if not messagebox.askyesno("Stop bridge", "Stop the active serial bridge?", parent=self.root):
+                return
         self.controller.stop()
 
     def _refresh_startup_button(self) -> None:
+        button = getattr(self, "preference_startup_button", None)
+        if button is None or not button.winfo_exists():
+            return
         if is_windows():
-            self.startup_button.configure(
+            button.configure(
                 text="Disable start at sign-in" if windows_startup_enabled() else "Start bridge at sign-in"
             )
         else:
-            self.startup_button.configure(text="Start at sign-in (Windows)", state="disabled")
+            button.configure(text="Start at sign-in (Windows)", state="disabled")
 
     def toggle_windows_startup(self) -> None:
         try:
@@ -1727,9 +2497,27 @@ class ProLabTranslatorGUI:
         self.root.after(100, self.start_bridge)
 
     def _append_log(self, text: str) -> None:
+        if " | HEX: " in text:
+            prefix, hex_part = text.split(" | HEX: ", 1)
+            byte_count = len(hex_part.split(" | ASCII: ", 1)[0].split())
+            direction = prefix.split(" ", 2)[-1]
+            self.last_traffic_var.set(
+                f"Last traffic: {datetime.now().strftime('%H:%M:%S')} · {direction} · {byte_count} byte(s)"
+            )
+        needle = self.activity_filter_var.get().strip().casefold()
+        if needle and needle not in text.casefold():
+            return
         self.traffic_text.configure(state="normal")
         self.traffic_text.insert("end", text.rstrip("\n") + "\n")
-        self.traffic_text.see("end")
+        try:
+            line_limit = max(100, int(self.activity_line_limit_var.get()))
+        except ValueError:
+            line_limit = 2000
+        line_count = int(self.traffic_text.index("end-1c").split(".")[0])
+        if line_count > line_limit:
+            self.traffic_text.delete("1.0", f"{line_count - line_limit + 1}.0")
+        if self.auto_scroll_var.get() and not self.pause_follow_var.get():
+            self.traffic_text.see("end")
         self.traffic_text.configure(state="disabled")
 
     def clear_traffic(self) -> None:
@@ -1737,12 +2525,18 @@ class ProLabTranslatorGUI:
         self.traffic_text.delete("1.0", "end")
         self.traffic_text.configure(state="disabled")
 
+    def copy_traffic(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.traffic_text.get("1.0", "end-1c"))
+
     def _drain_events(self) -> None:
         try:
             while True:
                 kind, payload = self.event_queue.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
+                elif kind == "metrics":
+                    self.session_health_var.set(payload)
                 elif kind == "state":
                     state, _, message = payload.partition("|")
                     self.status_var.set(message or state.title())
@@ -2317,6 +3111,8 @@ class ProLabTestClient(BaseTestClient):
 
 
 if __name__ == "__main__":
+    if "--runtime-check" in sys.argv[1:]:
+        raise SystemExit(runtime_dependency_check())
     if getattr(sys, "frozen", False) or "--gui" in sys.argv[1:]:
         start_test_bench = "--start-test-bench" in sys.argv[1:]
         autostart = "--autostart" in sys.argv[1:]
